@@ -30,15 +30,6 @@ pub struct Superblock {
 
 impl Superblock{
    pub fn new(l: &Layout) -> Self{
-        let magic = MAGIC;
-        let block_size = BLOCK_SIZE as u32;
-        let root_inode = ROOT_INODE;
-        let free_blocks = l.data_table_blocks;
-        let free_inodes = l.total_inodes;
-        let block_cursor = 0;
-        let inode_cursor = 0;
-        let clean_unmount = 1;
-
         Self {
             total_blocks: l.total_blocks,
             total_inodes: l.total_inodes,
@@ -52,14 +43,14 @@ impl Superblock{
             inode_table_start: l.inode_table_start,
             journal_start: l.journal_start,
             journal_blocks: l.journal_blocks,
-            magic,
-            block_size,
-            root_inode,
-            free_blocks,
-            free_inodes,
-            block_cursor,
-            inode_cursor,
-            clean_unmount
+            magic: MAGIC,
+            block_size: BLOCK_SIZE as u32,
+            root_inode: ROOT_INODE,
+            free_blocks: l.data_table_blocks,
+            free_inodes: l.total_inodes,
+            block_cursor: 0,
+            inode_cursor: 0,
+            clean_unmount: 1,
         }
     }
 
@@ -208,7 +199,7 @@ use super::*;
     #[test]
     fn validate_works(){
         let layout = Layout::compute(64*MIB, None).unwrap();
-        let  mut superblock = Superblock::new(&layout);
+        let  superblock = Superblock::new(&layout);
         assert_eq!(superblock.validate(superblock.total_blocks), Ok(()));
 
     }
@@ -233,7 +224,7 @@ use super::*;
     #[test]
     fn invalid_device_blocks_rejected(){
         let layout = Layout::compute(64*MIB, None).unwrap();
-        let  mut superblock = Superblock::new(&layout);
+        let  superblock = Superblock::new(&layout);
         assert_eq!(superblock.validate(superblock.total_blocks - 1), Err(FsError::CORRUPT));
     }
 
