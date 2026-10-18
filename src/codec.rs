@@ -30,7 +30,7 @@ pub fn get_u64(buff: &[u8], off: usize) -> u64{
 
 #[cfg(test)]
 mod tests{
-    use crate::codec::{get_u16, get_u32, get_u64, put_u16, put_u32, put_u64};
+    use super::*;
 
     #[test]
     fn correct_byte_order(){

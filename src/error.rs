@@ -15,6 +15,7 @@ pub enum FsError{
     ELOOP,
     ENAMETOOLONG,
     FAULTYCRASH,
+    CORRUPT,
     Io(io::ErrorKind),
 }
 
