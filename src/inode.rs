@@ -17,7 +17,7 @@ fn type_from_u8(value: u8) -> FsResult<Type>{
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Inode{
+pub struct Inode{
     pub id: u32,
     pub inode_type: Type,
     pub mode: u16,
@@ -118,8 +118,6 @@ pub fn inode_location (id: u32, inode_table_start: u32) -> (u32, usize){
 
 #[cfg(test)]
 mod tests{
-    use std::char::MAX;
-
 use super::*;
 
     fn inode() -> Inode
@@ -175,13 +173,12 @@ use super::*;
 
     #[test]
     fn block_with_zeros_is_free(){
-        let mut buff = [0u8; INODE_SIZE];
+        let buff = [0u8; INODE_SIZE];
         assert_eq!(Inode::decode(&buff).unwrap().inode_type, Type::Free);
     }
 
     #[test]
     fn unknown_type_returns_err() {
-        let inode = inode();
         let mut buff = [0u8; INODE_SIZE];
         buff[4] = 9;
 

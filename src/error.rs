@@ -10,6 +10,7 @@ pub enum FsError{
     EFBIG,
     ENOTDIR,
     ENOTEMPTY,
+    ENOMEM,
     EPERM,
     EINVAL,
     ELOOP,
