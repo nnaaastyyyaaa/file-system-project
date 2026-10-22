@@ -118,32 +118,13 @@ pub fn inode_location (id: u32, inode_table_start: u32) -> (u32, usize){
 
 #[cfg(test)]
 mod tests{
+use crate::test_utils::inode;
+
 use super::*;
 
-    fn inode() -> Inode
-    {
-        let mut direct = [0u32; DIRECT_POINTERS];
-        for n in 0..12{
-            direct[n] = 100 + n as u32;
-        }
-        Inode { 
-            id: 2, 
-            inode_type: Type::Symlink, 
-            mode: 8, 
-            uid: 1, 
-            gid: 2, 
-            size: 987, 
-            nlink: 6, 
-            mtime: 123456789, 
-            ctime: 987654321, 
-            direct, 
-            single_indirect: 098, 
-            double_indirect: 257 
-        }
-    }
     #[test]
     fn encode_decode_works() {
-        let inode = inode();
+        let inode = inode(2);
         let mut buff = [0u8; INODE_SIZE];
 
         inode.encode(&mut buff);
@@ -153,7 +134,7 @@ use super::*;
 
     #[test]
     fn encode_decode_works_on_gap() {
-        let mut inode = inode();
+        let mut inode = inode(2);
         inode.size = u64::MAX;
         inode.mtime = u64::MAX;
 
@@ -187,7 +168,7 @@ use super::*;
 
     #[test]
     fn inode_layout_is_correct() {
-        let inode = inode();
+        let inode = inode(2);
         let mut buff = [0u8; INODE_SIZE];
 
         inode.encode(&mut buff);

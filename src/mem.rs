@@ -22,7 +22,7 @@ impl BufferPooll {
         let mut vector = Vec::with_capacity(POOLL_BUFFERS);
         let buff = [0u8;  BLOCK_SIZE];
 
-        for n in 0..8{
+        for _ in 0..8{
             vector.push(Box::new(buff))
         }
 

@@ -7,3 +7,6 @@ pub mod superblock;
 pub mod inode;
 pub mod mem;
 pub mod dirent;
+pub mod alloc;
+pub mod inode_table;
+pub mod test_utils;
