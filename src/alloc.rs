@@ -106,7 +106,7 @@ mod test{
     fn first_inode_returned_correctly() {
         let (mut img, pool, mut sb) = full_image("alloc_first_inode", 4 * MIB);
 
-        assert_eq!(alloc_inode(&mut sb, &pool, &mut img), Ok(1));
+        assert_eq!(alloc_inode(&mut sb, &pool, &mut img), Ok(2));
         assert_eq!(pool.in_use(), 0);
     }
 
@@ -114,7 +114,7 @@ mod test{
     fn first_block_returned_correctly() {
         let (mut img, pool, mut sb) = full_image("alloc_first_block", 4 * MIB);
 
-        assert_eq!(alloc_block(&mut sb, &pool, &mut img), Ok(sb.data_table_start));
+        assert_eq!(alloc_block(&mut sb, &pool, &mut img), Ok(sb.data_table_start + 1));
         assert_eq!(pool.in_use(), 0);
     }
 
@@ -141,7 +141,7 @@ mod test{
     #[test]
     fn full_inode_bitmap_returns_enospc() {
         let (mut img, pool, mut sb) = full_image("inode_bitmap_returns_enospc", 4 * MIB);
-        for n in 0..sb.total_inodes{
+        for n in 0..sb.total_inodes - 1{
             println!("n = {}", n);
             alloc_inode(&mut sb, &pool, &mut img).unwrap();
         }

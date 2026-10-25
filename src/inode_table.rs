@@ -1,4 +1,4 @@
-use crate::{codec::get_u16, error::{FsError, FsResult}, inode::{Inode, Type, inode_location}, layout::INODE_SIZE, mem::BufferPooll, raw_device::RawDevice, superblock::Superblock};
+use crate::{error::{FsError, FsResult}, inode::{Inode, Type, inode_location}, layout::INODE_SIZE, mem::BufferPooll, raw_device::RawDevice, superblock::Superblock};
 
 fn check_id(id:u32, total_inodes: u32 ) -> FsResult<()>{
     if id < 1 || id > total_inodes { return Err(FsError::EINVAL) }
@@ -43,7 +43,7 @@ mod tests{
 
     #[test]
     fn writes_and_reads_corectly(){
-        let (mut img, pool, mut sb) = full_image("writes_and_reads", 4 * MIB);
+        let (mut img, pool, sb) = full_image("writes_and_reads", 4 * MIB);
         let inode = inode(2);
         write(&inode, &mut img, &sb, &pool).unwrap();
         assert_eq!(read(2, &mut img, &sb, &pool).unwrap(), inode );
@@ -52,7 +52,7 @@ mod tests{
 
     #[test]
     fn works_at_boundaries(){
-        let (mut img, pool, mut sb) = full_image("works_at_boundaries", 4 * MIB);
+        let (mut img, pool, sb) = full_image("works_at_boundaries", 4 * MIB);
 
         for id in [31, 32, 33] {
             let inode = inode(id);
@@ -67,14 +67,14 @@ mod tests{
 
     #[test]
     fn unused_inode_is_free(){
-        let (mut img, pool, mut sb) = full_image("works_at_boundaries", 4 * MIB);
+        let (mut img, pool,  sb) = full_image("unused_inode_is_free", 4 * MIB);
         assert_eq!(read(10, &mut img, &sb, &pool).unwrap().inode_type, Type::Free  );
         assert_eq!(pool.in_use(), 0);
     }
 
     #[test]
     fn id_out_of_range_return_error(){
-        let (mut img, pool, mut sb) = full_image("works_at_boundaries", 4 * MIB);
+        let (mut img, pool,  sb) = full_image("id_out_of_range_return_error", 4 * MIB);
         
         assert_eq!(read(0, &mut img, &sb, &pool), Err(FsError::EINVAL)  );
         assert_eq!(read(sb.total_inodes + 1, &mut img, &sb, &pool), Err(FsError::EINVAL)  );

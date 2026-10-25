@@ -1,9 +1,9 @@
 use std::{env::temp_dir, path::PathBuf, process::id};
 
-use crate::{bitmap::mark_tail_used, inode::{DIRECT_POINTERS, Inode, Type}, layout::Layout, mem::BufferPooll, raw_device::{FileDevice, RawDevice}, superblock::Superblock};
+use crate::{bitmap::mark_tail_used, inode::{DIRECT_POINTERS, Inode, Type}, layout::Layout, mem::BufferPooll, mkfs::mkfs, raw_device::{FileDevice, RawDevice}, superblock::Superblock};
 pub const MIB: u64 = 1024 * 1024;
 
-fn temp_image(name: &str) -> PathBuf{
+pub fn temp_image(name: &str) -> PathBuf{
     let mut buf = temp_dir();
     buf.push(format!("fs_{}_{}.img", name, id()));
     buf
@@ -13,18 +13,7 @@ pub fn full_image(name: &str, size: u64) -> (FileDevice, BufferPooll, Superblock
     let image = temp_image(name);
     let mut file_device = FileDevice::create(image.to_str().unwrap(), size).unwrap();
     let pool = BufferPooll::new();
-    let layout = Layout::compute(size, None).unwrap();
-    let superblock = Superblock::new(&layout);
-
-    let mut buff = pool.take().unwrap();
-    mark_tail_used(&mut buff, superblock.data_table_blocks as usize);
-    file_device.write(superblock.data_bitmap_blocks_start, &buff).unwrap();
-    drop(buff);
-
-    let mut buff = pool.take().unwrap();
-    mark_tail_used(&mut buff, superblock.total_inodes as usize);
-    file_device.write(superblock.inode_bitmap_blocks_start, &buff).unwrap();
-    drop(buff);
+    let superblock = mkfs(&pool, &mut file_device, None).unwrap();
 
     (file_device, pool, superblock)
 }

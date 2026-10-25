@@ -1,3 +1,4 @@
+use std::time::{SystemTime, UNIX_EPOCH};
 use crate::{codec::{get_u16, get_u32, get_u64, put_u16, put_u32, put_u64}, error::{FsError, FsResult}, layout::{INODE_SIZE, INODES_PER_BLOCK}};
 
 pub const DIRECT_POINTERS:usize = 12;
@@ -114,6 +115,13 @@ pub fn inode_location (id: u32, inode_table_start: u32) -> (u32, usize){
     let block = inode_table_start + (index / INODES_PER_BLOCK);
     let shift_in_block = (index % INODES_PER_BLOCK) * INODE_SIZE as u32;
     (block, shift_in_block as usize)
+}
+
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
