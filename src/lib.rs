@@ -11,3 +11,4 @@ pub mod alloc;
 pub mod inode_table;
 pub mod test_utils;
 pub mod mkfs;
+pub mod indirection;

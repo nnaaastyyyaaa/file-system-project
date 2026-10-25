@@ -142,7 +142,6 @@ mod test{
     fn full_inode_bitmap_returns_enospc() {
         let (mut img, pool, mut sb) = full_image("inode_bitmap_returns_enospc", 4 * MIB);
         for n in 0..sb.total_inodes - 1{
-            println!("n = {}", n);
             alloc_inode(&mut sb, &pool, &mut img).unwrap();
         }
         assert_eq!(alloc_inode(&mut sb, &pool, &mut img), Err(FsError::ENOSPC));
