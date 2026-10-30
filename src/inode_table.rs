@@ -1,7 +1,9 @@
 use crate::{error::{FsError, FsResult}, inode::{Inode, Type, inode_location}, layout::INODE_SIZE, mem::BufferPooll, raw_device::RawDevice, superblock::Superblock};
 
 fn check_id(id:u32, total_inodes: u32 ) -> FsResult<()>{
-    if id < 1 || id > total_inodes { return Err(FsError::EINVAL) }
+    if id < 1 || id > total_inodes { 
+        return Err(FsError::EINVAL) 
+    }
     Ok(())
 }
 
@@ -15,7 +17,9 @@ pub fn read<D: RawDevice>(id:u32, device: &mut D, superblock: &Superblock, pool:
     let data =   &buff[shift..shift + INODE_SIZE];
     let data_buff = <[u8; INODE_SIZE]>::try_from(data).map_err(|_| FsError::CORRUPT)?;
     let inode = Inode::decode(&data_buff)?;
-    if inode.inode_type == Type::Free { return Ok(Inode::empty(id)) };
+    if inode.inode_type == Type::Free { 
+        return Ok(Inode::empty(id)) 
+    };
 
     Ok(inode)
 }

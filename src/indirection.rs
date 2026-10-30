@@ -1,20 +1,21 @@
-use crate::{alloc::{alloc_block, free_block}, codec::{get_u32, put_u32}, error::{FsError, FsResult}, inode::Inode, mem::BufferPooll, raw_device::{BLOCK, RawDevice}, superblock::{self, Superblock}};
+use crate::{alloc::{alloc_block, free_block}, codec::{get_u32, put_u32}, error::{FsError, FsResult}, inode::Inode, mem::BufferPooll, raw_device::{ RawDevice}, superblock::{self, Superblock}};
 
 pub fn resolve_block<D: RawDevice>(device: &mut D, pool: &BufferPooll, superblock: &mut Superblock, inode: &mut Inode, allocate: bool, block: u32) -> FsResult<u32>{
     match block {
         0..12 => {
           let n = inode.direct[block as usize];
 
-          if n == 0 && !allocate { return Ok(0) }
+        if n == 0 && !allocate { 
+            return Ok(0) 
+        }
 
-          if n == 0 && allocate {
+        if n == 0 && allocate {
             let allocated = alloc_block(superblock, pool,  device)?;
             inode.direct[block as usize] = allocated;
             return  Ok(allocated);
-          }
+        }
           
           return  Ok(n);
-
         },
 
         12..1036 => {
@@ -108,7 +109,7 @@ mod tests{
     use super::*;
     use std::collections::HashSet;
 
-use crate::{alloc::alloc_block, codec::get_u32, error::FsError, indirection::{free_blocks_from, resolve_block}, raw_device::RawDevice, superblock, test_utils::{MIB, full_image, inode}};
+use crate::{alloc::alloc_block, codec::get_u32, error::FsError, indirection::{free_blocks_from, resolve_block}, raw_device::RawDevice, test_utils::{MIB, full_image, inode}};
 
     #[test]
     fn trying_to_read_hole_do_nothing(){

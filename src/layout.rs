@@ -30,7 +30,9 @@ impl Layout {
             None => total_blocks.div_ceil(INODE_RATIO),  
        };
 
-        if wanted_inodes == 0 { return Err(FsError::EINVAL); }
+        if wanted_inodes == 0 { 
+            return Err(FsError::EINVAL); 
+        }
 
        let inode_table_blocks = wanted_inodes.div_ceil(INODES_PER_BLOCK);
        let total_inodes = inode_table_blocks.checked_mul(INODES_PER_BLOCK).ok_or(FsError::EINVAL)?;
@@ -43,7 +45,9 @@ impl Layout {
        let inode_table_start = data_bitmap_blocks_start + data_bitmap_blocks;
        let data_table_start = inode_table_start + inode_table_blocks;
 
-       if data_table_start >= total_blocks { return Err(FsError::EINVAL)}
+        if data_table_start >= total_blocks { 
+            return Err(FsError::EINVAL)
+        }
 
        let data_table_blocks = total_blocks - data_table_start;
 

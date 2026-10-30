@@ -30,11 +30,15 @@ pub fn find_zero_bit(block: &BLOCK, start:usize) -> Option<usize>{
     let normalized_start = start % BITS_PER_BLOCK;
     for n in normalized_start..BITS_PER_BLOCK{
         let bit = get_bit(block, n);
-        if !bit { return Some(n)}
+        if !bit { 
+            return Some(n)
+        }
     }
     for n in 0..normalized_start{
         let bit = get_bit(block, n);
-        if !bit { return Some(n)}
+        if !bit { 
+            return Some(n)
+        }
     }
     None
 }

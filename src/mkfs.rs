@@ -36,7 +36,9 @@ pub fn mkfs<D: RawDevice>(pool: &BufferPooll, device: &mut D, inode_count: Optio
     drop(buff);
 
     let bit = alloc_inode(&mut superblock, pool, device)?;
-    if bit != ROOT_INODE { return Err(FsError::CORRUPT) }
+    if bit != ROOT_INODE { 
+        return Err(FsError::CORRUPT) 
+    }
 
     let block = alloc_block(&mut superblock, pool, device)?;
     let mut buff = pool.take()?;
@@ -63,7 +65,7 @@ pub fn mkfs<D: RawDevice>(pool: &BufferPooll, device: &mut D, inode_count: Optio
 
 #[cfg(test)]
 mod tests {
-    use crate::{bitmap::{count_zero_bits, get_bit}, dirent::decode_entry, layout::INODE_SIZE, raw_device::FileDevice, test_utils::{MIB, temp_image}};
+    use crate::{bitmap::{count_zero_bits, get_bit}, dirent::decode_entry, raw_device::FileDevice, test_utils::{MIB, temp_image}};
     use super::*;
 
     #[test]
@@ -124,7 +126,7 @@ mod tests {
             let image = temp_image("mkfs_resets_old");
             let mut file_device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
             let pool = BufferPooll::new();
-            let mut superblock = mkfs(&pool, &mut file_device, Some(100)).unwrap();
+            let superblock = mkfs(&pool, &mut file_device, Some(100)).unwrap();
 
             let mut buff = pool.take().unwrap();
             buff.fill(0xff);
@@ -135,7 +137,7 @@ mod tests {
         let image = temp_image("mkfs_test");
         let mut file_device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
         let pool = BufferPooll::new();
-        let mut superblock = mkfs(&pool, &mut file_device, Some(100)).unwrap();
+        let superblock = mkfs(&pool, &mut file_device, Some(100)).unwrap();
         let mut buff = pool.take().unwrap();
         file_device.read(superblock.data_table_start + 1, &mut buff).unwrap();
 

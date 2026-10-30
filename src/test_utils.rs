@@ -1,6 +1,6 @@
 use std::{env::temp_dir, path::PathBuf, process::id};
 
-use crate::{bitmap::mark_tail_used, inode::{DIRECT_POINTERS, Inode, Type}, layout::Layout, mem::BufferPooll, mkfs::mkfs, raw_device::{FileDevice, RawDevice}, superblock::Superblock};
+use crate::{ inode::{DIRECT_POINTERS, Inode, Type},  mem::BufferPooll, mkfs::mkfs, raw_device::{FileDevice}, superblock::Superblock};
 pub const MIB: u64 = 1024 * 1024;
 
 pub fn temp_image(name: &str) -> PathBuf{

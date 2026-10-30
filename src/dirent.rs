@@ -4,12 +4,20 @@ pub const ENTRY_SIZE: usize = 64;
 pub const NAME_SIZE: usize = 59;
 
 pub fn encode_entry(buff: &mut [u8], id:u32, name: &str) -> FsResult<()> {
-    if id == 0 { return Err(FsError::EINVAL)}
-    if buff.len() < ENTRY_SIZE { return Err(FsError::EINVAL)}
+    if id == 0 { 
+        return Err(FsError::EINVAL)
+    }
+    if buff.len() < ENTRY_SIZE { 
+        return Err(FsError::EINVAL)
+    }
 
     let name_bytes = name.as_bytes();
-    if name_bytes.is_empty() || name_bytes.contains(&b'/') || name_bytes.contains(&0)  { return Err(FsError::EINVAL) }
-    if name_bytes.len() > NAME_SIZE  { return Err(FsError::ENAMETOOLONG) }
+    if name_bytes.is_empty() || name_bytes.contains(&b'/') || name_bytes.contains(&0)  { 
+        return Err(FsError::EINVAL) 
+    }
+    if name_bytes.len() > NAME_SIZE  { 
+        return Err(FsError::ENAMETOOLONG) 
+    }
 
     buff[0..ENTRY_SIZE].fill(0);
     put_u32(buff, 0, id);
@@ -21,14 +29,21 @@ pub fn encode_entry(buff: &mut [u8], id:u32, name: &str) -> FsResult<()> {
 }
 
 pub fn decode_entry(buff: &[u8]) -> FsResult<Option<(u32, String)>>{
-    if buff.len() < ENTRY_SIZE { return Err(FsError::EINVAL)}
+    if buff.len() < ENTRY_SIZE { 
+        return Err(FsError::EINVAL)
+    }
 
     let id = get_u32(buff, 0);
-    if id == 0 { return Ok(None) }
+    if id == 0 { 
+        return Ok(None) }
 
     let name_len = buff[4] as usize;
-    if name_len == 0 { return Err(FsError::CORRUPT) }
-    if name_len > NAME_SIZE { return Err(FsError::CORRUPT) }
+    if name_len == 0 { 
+        return Err(FsError::CORRUPT) 
+    }
+    if name_len > NAME_SIZE { 
+        return Err(FsError::CORRUPT) 
+    }
 
     let name_bytes = &buff[5..5 + name_len];
     match String::from_utf8(name_bytes.to_vec()){
