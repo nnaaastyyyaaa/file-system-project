@@ -1,4 +1,4 @@
-use crate::{dirent::{ENTRY_SIZE, decode_entry, encode_entry}, error::{FsError, FsResult}, file_io::{read_file, write_file}, indirection::resolve_block, inode::Inode, inode_table, mem::BufferPooll, raw_device::{BLOCK_SIZE, RawDevice}, superblock::{self, Superblock}};
+use crate::{dirent::{ENTRY_SIZE, decode_entry, encode_entry}, error::{FsError, FsResult}, file_io::{read_file, write_file}, inode::Inode, mem::BufferPooll, raw_device::{RawDevice}, superblock::{Superblock}};
 
 fn find_entry<D: RawDevice>(device: &mut D, superblock: &mut Superblock, inode: &mut Inode, pool: &BufferPooll, name: &str) -> FsResult<(u32, u64)> {
     let records = inode.size / ENTRY_SIZE as u64;
@@ -101,7 +101,7 @@ pub fn list<D: RawDevice>(device: &mut D, superblock: &mut Superblock, inode: &m
 #[cfg(test)]
 mod tests{
     use super::*;
-    use crate::{test_utils::{MIB, full_image}};
+    use crate::{inode_table, raw_device::BLOCK_SIZE, test_utils::{MIB, full_image}};
 
     #[test]
     fn lookup_return_id_for_root_after_mkfs(){
@@ -181,7 +181,7 @@ mod tests{
         let mut root_inode = inode_table::read(1, &mut device, &superblock, &pool).unwrap();
 
         assert_eq!(add_entry(&mut device, &mut superblock, &mut root_inode, &pool, 2, "a/b"), Err(FsError::EINVAL));
-        assert_eq!(add_entry(&mut device, &mut superblock, &mut root_inode, &pool, 2, "qwertyuiopasdfghjklzxcvbnmqwertyuiopasdfghjklzxcvbnmlkjhgfdsa"), Err(FsError::ENAMETOOLONG));
+        assert_eq!(add_entry(&mut device, &mut superblock, &mut root_inode, &pool, 2, &"a".repeat(65)), Err(FsError::ENAMETOOLONG));
         assert_eq!(lookup(&mut device, &mut superblock, &mut root_inode, &pool, "a/b"), Err(FsError::ENOENT));
         assert_eq!(root_inode.size, ENTRY_SIZE as u64 * 2);
     }

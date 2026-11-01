@@ -14,3 +14,4 @@ pub mod mkfs;
 pub mod indirection;
 pub mod file_io;
 pub mod directory;
+pub mod fs;
