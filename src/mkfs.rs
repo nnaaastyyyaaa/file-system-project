@@ -54,7 +54,7 @@ pub fn mkfs<D: RawDevice>(pool: &BufferPooll, device: &mut D, inode_count: Optio
     first_inode.mode = 0o777;
     first_inode.ctime = now_ms();
     first_inode.mtime = now_ms();
-    first_inode.size = BLOCK_SIZE as u64;
+    first_inode.size = 2 * ENTRY_SIZE as u64;
     first_inode.direct[0] = block;
 
     inode_table::write(&first_inode, device, &superblock, pool)?;

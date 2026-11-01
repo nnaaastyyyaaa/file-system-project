@@ -13,3 +13,4 @@ pub mod test_utils;
 pub mod mkfs;
 pub mod indirection;
 pub mod file_io;
+pub mod directory;
