@@ -1,7 +1,10 @@
 use std::{collections::HashMap};
 
-use crate::{alloc::{alloc_inode, free_inode}, directory::{add_entry, lookup}, error::{FsError, FsResult}, inode::{Inode, Type, now_ms}, inode_table, mem::BufferPooll, mkfs::mkfs, raw_device::RawDevice, superblock::{ROOT_INODE, Superblock}};
+use crate::{alloc::{alloc_inode, free_inode}, directory::{add_entry, lookup, remove_entry}, error::{FsError, FsResult}, file_io::truncate_file, inode::{Inode, Type, now_ms}, inode_table, mem::BufferPooll, mkfs::mkfs, raw_device::RawDevice, superblock::{ROOT_INODE, Superblock}};
 
+const MAX_OPEN_FILES: usize = 64; 
+
+#[derive(Debug, PartialEq)]
 pub struct OpenedFile {
     pub inode_id: u32,
     pub offset: u64,
@@ -94,6 +97,52 @@ impl <D: RawDevice> Fs<D> {
         }
 
         Ok(())
+    }
+
+    pub fn unlink(&mut self, name: &str) -> FsResult<()>{
+        let mut root_inode = inode_table::read(ROOT_INODE, &mut self.device, &mut self.superblock, &self.pool)?;
+        let mut inode = self.stat_file(name)?;
+        let now = now_ms();
+
+        inode.nlink = inode.nlink.checked_sub(1).ok_or(FsError::CORRUPT)?;
+        inode.ctime = now;
+        remove_entry(&mut self.device, &mut self.superblock, &mut root_inode, &self.pool, name)?;
+        inode_table::write(&inode, &mut self.device, &mut self.superblock,  &self.pool)?;
+
+        if inode.nlink == 0 {
+            let opened = self.opened_inodes.contains_key(&inode.id);
+            if !opened {
+                truncate_file(&mut self.device, &self.pool, &mut self.superblock, &mut inode, 0)?;
+                inode_table::write(&Inode::empty(inode.id), &mut self.device, &mut self.superblock,  &self.pool)?;
+                free_inode(&mut self.superblock, inode.id, &self.pool, &mut self.device)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn open(&mut self, name: &str) -> FsResult<usize>{
+        let inode = self.stat_file(name)?;
+        if inode.inode_type == Type::Dir {
+            return Err(FsError::EISDIR)
+        }
+        let fd = match self.opened_files.iter().position(|el| el.is_none()){
+            Some(fd) => fd,
+            None => {
+                if self.opened_files.len() >= MAX_OPEN_FILES {
+                    return Err(FsError::ENOMEM);            
+                }
+                self.opened_files.push(None);                
+                self.opened_files.len() - 1                 
+            }
+        };
+        let opened_file = OpenedFile{
+            inode_id: inode.id,
+            offset: 0
+        };
+        self.opened_files[fd] = Some(opened_file);
+        *self.opened_inodes.entry(inode.id).or_insert(0) += 1;
+        Ok(fd)
     }
 
 }
@@ -409,6 +458,7 @@ mod tests{
         assert_eq!(lookup(&mut fs.device, &mut fs.superblock, &mut root_inode, &fs.pool, "data"), lookup(&mut fs.device, &mut fs.superblock, &mut root_inode, &fs.pool, "new_data"));
         let inode = inode_table::read(file_id, &mut fs.device, &mut fs.superblock, &fs.pool).unwrap();
         assert_eq!(inode.nlink, 2);
+        assert_eq!(fs.pool.in_use(), 0);
     }
 
     #[test]
@@ -421,6 +471,7 @@ mod tests{
         assert_eq!(fs.link("data", "new_data"), Err(FsError::ENOENT));
         let entries = fs.ls().unwrap();
         assert_eq!(entries.len(), 2);
+        assert_eq!(fs.pool.in_use(), 0);
     }
 
     #[test]
@@ -436,6 +487,7 @@ mod tests{
 
         let inode = fs.stat_file("data").unwrap();
         assert_eq!(inode.nlink, 1);
+        assert_eq!(fs.pool.in_use(), 0);
     }
 
     #[test]
@@ -450,6 +502,7 @@ mod tests{
 
         let root_inode = inode_table::read(ROOT_INODE, &mut fs.device, &mut fs.superblock, &fs.pool).unwrap();
         assert_eq!(root_inode.nlink, 2);
+        assert_eq!(fs.pool.in_use(), 0);
     }
 
     #[test]
@@ -465,6 +518,7 @@ mod tests{
 
         let inode = fs.stat_file("data").unwrap();
         assert_eq!(inode.nlink, 1);
+        assert_eq!(fs.pool.in_use(), 0);
     }
 
     #[test]
@@ -480,6 +534,7 @@ mod tests{
 
         let inode = fs.stat_file("data").unwrap();
         assert_eq!(inode.nlink, 3);
+        assert_eq!(fs.pool.in_use(), 0);
     }
 
     #[test]
@@ -499,5 +554,207 @@ mod tests{
         assert_ne!(root_inode.direct[0], 0);
         assert_ne!(root_inode.direct[1], 0);
         assert_eq!(root_inode.size, (BLOCK_SIZE + ENTRY_SIZE) as u64);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn unlink_remove_name(){
+        let image = temp_image("unlink_remove_name");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        let id = fs.create_file("data").unwrap();
+        fs.link("data", "one_more_name").unwrap();
+
+        let inodes_before = fs.superblock.free_inodes;
+        let blocks_before = fs.superblock.free_blocks;
+
+        let mut inode = fs.stat_file("data").unwrap();
+        assert_eq!(inode.nlink, 2);
+        assert_eq!(fs.stat_file("one_more_name").unwrap().id, id);
+
+        fs.unlink("data").unwrap();
+        assert_eq!(fs.stat_file("data"), Err(FsError::ENOENT));
+
+        inode = fs.stat_file("one_more_name").unwrap();
+        assert_eq!(inode.id, id);
+
+        assert_eq!(fs.superblock.free_blocks, blocks_before);
+        assert_eq!(fs.superblock.free_inodes, inodes_before);
+
+        let entries = fs.ls().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[2], (id, "one_more_name".to_string()));
+        assert_eq!(fs.pool.in_use(), 0);
+
+    }
+
+    #[test]
+    fn unlink_remove_file(){
+        let image = temp_image("unlink_remove_file");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        let id = fs.create_file("data").unwrap();
+
+        let inodes_before = fs.superblock.free_inodes;
+        let blocks_before = fs.superblock.free_blocks;
+
+        fs.unlink("data").unwrap();
+
+        assert_eq!(fs.stat_file("data"), Err(FsError::ENOENT));
+        assert_eq!(fs.superblock.free_blocks, blocks_before);
+        assert_eq!(fs.superblock.free_inodes - 1, inodes_before);
+        assert_eq!(fs.create_file("other").unwrap(), id);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn unlink_two_names_in_row(){
+        let image = temp_image("unlink_two_names_in_row");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+        let inodes_before = fs.superblock.free_inodes;
+        let blocks_before = fs.superblock.free_blocks;
+
+        let id =fs.create_file("data").unwrap();
+        fs.link("data", "name2").unwrap();
+        assert_eq!(fs.stat_file("name2").unwrap().id, id);
+
+        fs.unlink("data").unwrap();
+        fs.unlink("name2").unwrap();
+
+        assert_eq!(fs.stat_file("data"), Err(FsError::ENOENT));
+        assert_eq!(fs.stat_file("name2"), Err(FsError::ENOENT));
+
+        assert_eq!(fs.superblock.free_blocks, blocks_before);
+        assert_eq!(fs.superblock.free_inodes, inodes_before);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn unlink_with_unknown_name() {
+        let image = temp_image("unlink_with_unknown_name");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        assert_eq!(fs.unlink("data"), Err(FsError::ENOENT));
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn unlink_root_entries(){
+        let image = temp_image("unlink_root_entries");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        assert_eq!(fs.unlink("."), Err(FsError::EINVAL));
+        assert_eq!(fs.unlink(".."), Err(FsError::EINVAL));
+
+        let inode = fs.stat_file(".").unwrap();
+        assert_eq!(inode.nlink, 2);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn open_return_correct_fd(){
+        let image = temp_image("open_return_correct_fd");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        fs.create_file("data").unwrap();
+        assert_eq!(fs.open("data").unwrap(), 0);
+
+        fs.create_file("new_data").unwrap();
+        assert_eq!(fs.open("new_data").unwrap(), 1);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn open_save_correct_opened_file(){
+        let image = temp_image("open_save_correct_opened_file");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        let id = fs.create_file("data").unwrap();
+        let fd = fs.open("data").unwrap();
+
+        assert_eq!(fs.opened_files[fd], Some(OpenedFile { inode_id: id, offset: 0}));
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+    
+    #[test]
+    fn open_unknown_name_return_error(){
+        let image = temp_image("open_unknown_name_return_error");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        assert_eq!(fs.open("data"), Err(FsError::ENOENT));
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn open_dir_name_return_eisdir(){
+        let image = temp_image("open_dir_name_return_eisdir");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        assert_eq!(fs.open("."), Err(FsError::EISDIR));
+        assert_eq!(fs.open(".."), Err(FsError::EISDIR));
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn open_more_than_allowed_files_return_error(){
+        let image = temp_image("open_more_than_allowed_files_return_error");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        for n in 0..MAX_OPEN_FILES{
+            fs.create_file(&format!("data{}",n)).unwrap();
+            fs.open(&format!("data{}",n)).unwrap();
+        }
+        fs.create_file("data64").unwrap();
+
+        assert_eq!(fs.open("data64"), Err(FsError::ENOMEM));
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn open_two_files_have_separate_fds_and_counters(){
+        let image = temp_image("open_two_files_have_separate_fds_and_counters");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        let id_a = fs.create_file("a").unwrap();
+        let id_b = fs.create_file("b").unwrap();
+
+        let fd_a = fs.open("a").unwrap();
+        let fd_b = fs.open("b").unwrap();
+        let fd_a2 = fs.open("a").unwrap();
+
+        assert_eq!(fd_a, 0);
+        assert_eq!(fd_b, 1);
+        assert_eq!(fd_a2, 2);
+
+        assert_eq!(fs.opened_files[fd_a], Some(OpenedFile { inode_id: id_a, offset: 0 }));
+        assert_eq!(fs.opened_files[fd_b], Some(OpenedFile { inode_id: id_b, offset: 0 }));
+        assert_eq!(fs.opened_files[fd_a2], Some(OpenedFile { inode_id: id_a, offset: 0 }));
+
+        assert_eq!(fs.opened_inodes.get(&id_a), Some(&2));
+        assert_eq!(fs.opened_inodes.get(&id_b), Some(&1));
+        assert_eq!(fs.opened_inodes.len(), 2);
+        assert_eq!(fs.pool.in_use(), 0);
     }
 }

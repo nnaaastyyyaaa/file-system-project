@@ -1,6 +1,6 @@
 use crate::{dirent::{ENTRY_SIZE, decode_entry, encode_entry}, error::{FsError, FsResult}, file_io::{read_file, write_file}, inode::Inode, mem::BufferPooll, raw_device::{RawDevice}, superblock::{Superblock}};
 
-fn find_entry<D: RawDevice>(device: &mut D, superblock: &mut Superblock, inode: &mut Inode, pool: &BufferPooll, name: &str) -> FsResult<(u32, u64)> {
+pub fn find_entry<D: RawDevice>(device: &mut D, superblock: &mut Superblock, inode: &mut Inode, pool: &BufferPooll, name: &str) -> FsResult<(u32, u64)> {
     let records = inode.size / ENTRY_SIZE as u64;
 
     for n in 0..records {
