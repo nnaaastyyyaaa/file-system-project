@@ -1,6 +1,6 @@
 use std::{collections::HashMap};
 
-use crate::{alloc::{alloc_inode, free_inode}, directory::{add_entry, lookup, remove_entry}, error::{FsError, FsResult}, file_io::truncate_file, inode::{Inode, Type, now_ms}, inode_table, mem::BufferPooll, mkfs::mkfs, raw_device::RawDevice, superblock::{ROOT_INODE, Superblock}};
+use crate::{alloc::{alloc_inode, free_inode}, directory::{add_entry, lookup, remove_entry}, error::{FsError, FsResult}, file_io::{read_file, truncate_file, write_file}, inode::{Inode, Type, now_ms}, inode_table, mem::BufferPooll, mkfs::mkfs, raw_device::RawDevice, superblock::{ROOT_INODE, Superblock}};
 
 const MAX_OPEN_FILES: usize = 64; 
 
@@ -130,7 +130,7 @@ impl <D: RawDevice> Fs<D> {
 
     pub fn open(&mut self, name: &str) -> FsResult<usize>{
         let inode = self.stat_file(name)?;
-        if inode.inode_type == Type::Dir {
+        if inode.inode_type != Type::File {
             return Err(FsError::EISDIR)
         }
         let fd = match self.opened_files.iter().position(|el| el.is_none()){
@@ -168,12 +168,66 @@ impl <D: RawDevice> Fs<D> {
         self.maybe_free(id)
     }
 
+    pub fn seek(&mut self, fd:usize, offset:u64) -> FsResult<()>{
+        let file = self.opened_files
+            .get_mut(fd)
+            .and_then(|slot| slot.as_mut())
+            .ok_or(FsError::EINVAL)?;
+
+        file.offset = offset;
+        Ok(())
+    }
+
+    pub fn write(&mut self, fd: usize, buff: &[u8]) -> FsResult<u64>{
+        let file =  self.opened_files
+            .get(fd)
+            .copied().flatten().ok_or(FsError::EINVAL)?;
+
+        file.offset.checked_add(buff.len() as u64).ok_or(FsError::EFBIG)?;
+
+        let mut inode = inode_table::read(file.inode_id, &mut self.device, &mut self.superblock, &self.pool)?;
+        let written = write_file(&mut self.device, &self.pool, &mut self.superblock, &mut inode, file.offset, buff)?;
+        
+        if let Some(Some(f)) = self.opened_files.get_mut(fd) {
+            f.offset += written;
+        }
+        Ok(written)
+    }
+
+    pub fn read(&mut self, fd: usize, buff: &mut [u8]) -> FsResult<u64>{
+        let file =  self.opened_files
+            .get(fd)
+            .copied().flatten().ok_or(FsError::EINVAL)?;
+
+        file.offset.checked_add(buff.len() as u64).ok_or(FsError::EFBIG)?;
+
+        let mut inode = inode_table::read(file.inode_id, &mut self.device, &mut self.superblock, &self.pool)?;
+
+        let read = read_file(&mut self.device, &self.pool, &mut self.superblock, &mut inode, file.offset, buff)?;
+        
+        if let Some(Some(f)) = self.opened_files.get_mut(fd) {
+            f.offset += read;
+        }
+        Ok(read)
+    }
+
+    pub fn truncate(&mut self, name: &str, size: u64) -> FsResult<()>{
+        let mut inode = self.stat_file(name)?;
+
+        if inode.inode_type != Type::File{
+            return Err(FsError::EISDIR);
+        }
+
+        truncate_file(&mut self.device, &self.pool, &mut self.superblock, &mut inode, size)?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests{
     use super::*;
-    use crate::{directory::{list, lookup}, dirent::ENTRY_SIZE, error::FsError, inode::Type, inode_table, mem::BufferPooll, raw_device::{BLOCK_SIZE, FileDevice}, superblock::ROOT_INODE, test_utils::{MIB, temp_image}};
+    use crate::{directory::{list, lookup}, dirent::ENTRY_SIZE, error::FsError, file_io::read_file, inode::Type, inode_table, mem::BufferPooll, raw_device::{BLOCK_SIZE, FileDevice}, superblock::ROOT_INODE, test_utils::{MIB, temp_image}};
 
     #[test]
     fn test_format(){
@@ -960,6 +1014,571 @@ mod tests{
         assert_eq!(fs.superblock.free_inodes, inodes_before + 1);
         assert_eq!(fs.superblock.free_blocks, blocks_before);
         assert_eq!(fs.ls().unwrap().len(), 2);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+        #[test]
+    fn seek_sets_offset_only_for_given_fd(){
+        let image = temp_image("seek_sets_offset_only_for_given_fd");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        let id_a = fs.create_file("a").unwrap();
+        let id_b = fs.create_file("b").unwrap();
+        let fd_a = fs.open("a").unwrap();
+        let fd_b = fs.open("b").unwrap();
+
+        fs.seek(fd_a, 100).unwrap();
+
+        assert_eq!(fs.opened_files[fd_a], Some(OpenedFile { inode_id: id_a, offset: 100 }));
+        assert_eq!(fs.opened_files[fd_b], Some(OpenedFile { inode_id: id_b, offset: 0 }));
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn seek_invalid_fd_returns_err_and_changes_nothing(){
+        let image = temp_image("seek_invalid_fd_returns_err_and_changes_nothing");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        assert_eq!(fs.seek(0, 10), Err(FsError::EINVAL));
+
+        fs.create_file("a").unwrap();
+        fs.create_file("b").unwrap();
+        fs.open("a").unwrap();
+        fs.open("b").unwrap();
+        fs.close(0).unwrap();
+
+        let files_before = fs.opened_files.clone();
+        let inodes_before = fs.opened_inodes.clone();
+
+        assert_eq!(fs.seek(0, 10), Err(FsError::EINVAL));
+        assert_eq!(fs.seek(100, 10), Err(FsError::EINVAL));
+
+        assert_eq!(fs.opened_files, files_before);
+        assert_eq!(fs.opened_inodes, inodes_before);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn seek_two_fds_of_same_file_have_independent_offsets(){
+        let image = temp_image("seek_two_fds_of_same_file_have_independent_offsets");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        let id = fs.create_file("a").unwrap();
+        let fd1 = fs.open("a").unwrap();
+        let fd2 = fs.open("a").unwrap();
+
+        fs.seek(fd1, 5).unwrap();
+        fs.seek(fd2, 50).unwrap();
+
+        assert_eq!(fs.opened_files[fd1], Some(OpenedFile { inode_id: id, offset: 5 }));
+        assert_eq!(fs.opened_files[fd2], Some(OpenedFile { inode_id: id, offset: 50 }));
+        assert_eq!(fs.opened_inodes.get(&id), Some(&2));
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn seek_twice_overwrites_offset(){
+        let image = temp_image("seek_twice_overwrites_offset");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        let id = fs.create_file("a").unwrap();
+        let fd = fs.open("a").unwrap();
+
+        fs.seek(fd, 1000).unwrap();
+        fs.seek(fd, 7).unwrap();
+        assert_eq!(fs.opened_files[fd], Some(OpenedFile { inode_id: id, offset: 7 }));
+
+        fs.seek(fd, 0).unwrap();
+        assert_eq!(fs.opened_files[fd], Some(OpenedFile { inode_id: id, offset: 0 }));
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn seek_does_not_touch_disk_state(){
+        let image = temp_image("seek_does_not_touch_disk_state");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        let id = fs.create_file("a").unwrap();
+        let fd = fs.open("a").unwrap();
+
+        let inode_before = inode_table::read(id, &mut fs.device, &fs.superblock, &fs.pool).unwrap();
+        let inodes_before = fs.superblock.free_inodes;
+        let blocks_before = fs.superblock.free_blocks;
+        let opened_before = fs.opened_inodes.clone();
+
+        fs.seek(fd, 12345).unwrap();
+
+        let inode_after = inode_table::read(id, &mut fs.device, &fs.superblock, &fs.pool).unwrap();
+        assert_eq!(inode_after, inode_before);
+        assert_eq!(fs.superblock.free_inodes, inodes_before);
+        assert_eq!(fs.superblock.free_blocks, blocks_before);
+        assert_eq!(fs.opened_inodes, opened_before);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn reopened_slot_starts_with_zero_offset(){
+        let image = temp_image("reopened_slot_starts_with_zero_offset");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        let id = fs.create_file("a").unwrap();
+        let fd = fs.open("a").unwrap();
+        fs.seek(fd, 500).unwrap();
+        fs.close(fd).unwrap();
+
+        let fd2 = fs.open("a").unwrap();
+        assert_eq!(fd2, fd);
+        assert_eq!(fs.opened_files[fd2], Some(OpenedFile { inode_id: id, offset: 0 }));
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn seek_works_on_unlinked_opened_file(){
+        let image = temp_image("seek_works_on_unlinked_opened_file");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        let id = fs.create_file("a").unwrap();
+        let fd = fs.open("a").unwrap();
+        fs.unlink("a").unwrap();
+
+        assert_eq!(fs.seek(fd, 42), Ok(()));
+        assert_eq!(fs.opened_files[fd], Some(OpenedFile { inode_id: id, offset: 42 }));
+
+        fs.close(fd).unwrap();
+        assert_eq!(fs.seek(fd, 1), Err(FsError::EINVAL));
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn write_file_returns_written_and_moves_offset(){
+        let image = temp_image("write_file_returns_written_and_moves_offset");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        let id = fs.create_file("a").unwrap();
+        let fd = fs.open("a").unwrap();
+        let text = "Hello, my name is Nastya".as_bytes();
+        let written = fs.write(fd, text).unwrap();
+
+        assert_eq!(written, text.len() as u64);
+        assert_eq!(fs.opened_files.get(fd).unwrap().unwrap(), OpenedFile{
+            inode_id: id,
+            offset: written
+        });
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn two_writes_in_row_append_offset(){
+        let image = temp_image("two_writes_in_row_append_offset");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        let id = fs.create_file("a").unwrap();
+        let fd = fs.open("a").unwrap();
+        let text = "Hello".as_bytes();
+        fs.write(fd, text).unwrap();
+
+        assert_eq!(fs.opened_files.get(fd).unwrap().unwrap(), OpenedFile{
+            inode_id: id,
+            offset: text.len() as u64
+        });
+
+        let text2 = "World".as_bytes();
+        fs.write(fd, text2).unwrap();
+
+        assert_eq!(fs.opened_files.get(fd).unwrap().unwrap(), OpenedFile{
+            inode_id: id,
+            offset: (text.len() + text2.len()) as u64
+        });
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn write_empty_buff_changes_nothing(){
+        let image = temp_image("write_empty_buff_changes_nothing");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        assert_eq!(fs.write(0, b""), Err(FsError::EINVAL));
+
+        fs.create_file("a").unwrap();
+        fs.create_file("b").unwrap();
+        fs.open("a").unwrap();
+        fs.open("b").unwrap();
+        fs.close(0).unwrap();
+
+        let files_before = fs.opened_files.clone();
+        let blocks_before = fs.superblock.free_blocks;
+
+        assert_eq!(fs.write(0, b"x"), Err(FsError::EINVAL));
+        assert_eq!(fs.write(100, b"x"), Err(FsError::EINVAL));
+
+        assert_eq!(fs.opened_files, files_before);
+        assert_eq!(fs.superblock.free_blocks, blocks_before);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn write_invalid_fd_returns_err_and_changes_nothing(){
+        let image = temp_image("write_invalid_fd_returns_err_and_changes_nothing");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        let id = fs.create_file("a").unwrap();
+        let fd = fs.open("a").unwrap();
+        fs.write(fd, b"").unwrap();
+
+        assert_eq!(fs.opened_files.get(fd).unwrap().unwrap(), OpenedFile{
+            inode_id: id,
+            offset: 0
+        });  
+    }
+
+    #[test]
+    fn write_to_full_disk_is_partial_then_enospc(){
+        let image = temp_image("write_to_full_disk_is_partial_then_enospc");
+        let device = FileDevice::create(image.to_str().unwrap(), 2 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, Some(32)).unwrap();
+
+        let id = fs.create_file("a").unwrap();
+        let fd = fs.open("a").unwrap();
+        fs.write(fd, b"old").unwrap();
+
+        let huge = vec![0u8; 500 * BLOCK_SIZE];
+        let written = fs.write(fd, &huge).unwrap();
+
+        assert!(written > 0 && written < huge.len() as u64);
+        assert_eq!(fs.opened_files[fd], Some(OpenedFile { inode_id: id, offset: 3 + written }));
+        assert_eq!(fs.stat_file("a").unwrap().size, 3 + written);
+        assert_eq!(fs.superblock.free_blocks, 0);
+
+        let offset_before = fs.opened_files[fd];
+        assert_eq!(fs.write(fd, b"x"), Err(FsError::ENOSPC));
+        assert_eq!(fs.opened_files[fd], offset_before);
+        assert_eq!(fs.stat_file("a").unwrap().size, 3 + written);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn write_through_two_fds_has_independent_offsets_shared_size(){
+        let image = temp_image("write_through_two_fds_has_independent_offsets_shared_size");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        let id = fs.create_file("a").unwrap();
+        let fd1 = fs.open("a").unwrap();
+        let fd2 = fs.open("a").unwrap();
+
+        fs.write(fd1, b"12345").unwrap();
+
+        assert_eq!(fs.opened_files[fd1], Some(OpenedFile { inode_id: id, offset: 5 }));
+        assert_eq!(fs.opened_files[fd2], Some(OpenedFile { inode_id: id, offset: 0 }));
+        assert_eq!(fs.stat_file("a").unwrap().size, 5);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn write_to_unlinked_file_is_freed_on_close(){
+        let image = temp_image("write_to_unlinked_file_is_freed_on_close");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        let inodes_before = fs.superblock.free_inodes;
+        let blocks_before = fs.superblock.free_blocks;
+
+        fs.create_file("a").unwrap();
+        let fd = fs.open("a").unwrap();
+        fs.unlink("a").unwrap();
+        fs.write(fd, &vec![1u8; 3 * BLOCK_SIZE]).unwrap();
+        assert_eq!(fs.superblock.free_blocks, blocks_before - 3);
+
+        fs.close(fd).unwrap();
+        assert_eq!(fs.superblock.free_inodes, inodes_before);
+        assert_eq!(fs.superblock.free_blocks, blocks_before);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn read_returns_written_data() {
+        let image = temp_image("read_returns_written_data");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        fs.create_file("a").unwrap();
+        let fd = fs.open("a").unwrap();
+        fs.write(fd, b"Hello").unwrap();
+
+        fs.seek(fd, 0).unwrap();
+        let mut buf = [0u8; 5];
+        let n = fs.read(fd, &mut buf).unwrap();
+
+        assert_eq!(n, 5);
+        assert_eq!(&buf, b"Hello");
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn read_at_eof_returns_zero() {
+        let image = temp_image("read_at_eof_returns_zero");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        fs.create_file("a").unwrap();
+        let fd = fs.open("a").unwrap();
+        let mut buf = [0u8; 10];
+
+        assert_eq!(fs.read(fd, &mut buf).unwrap(), 0);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn truncate_grow_empty_file_creates_no_blocks(){
+        let image = temp_image("truncate_grow_empty_file_creates_no_blocks");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        fs.create_file("a").unwrap();
+        let blocks_before = fs.superblock.free_blocks;
+
+        fs.truncate("a", 3 * BLOCK_SIZE as u64 + 100).unwrap();
+
+        let inode = fs.stat_file("a").unwrap();
+        assert_eq!(inode.size, 3 * BLOCK_SIZE as u64 + 100);
+        assert_eq!(inode.direct, [0u32; 12]);
+        assert_eq!(fs.superblock.free_blocks, blocks_before);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn truncate_grow_reads_zeros(){
+        let image = temp_image("truncate_grow_reads_zeros");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        fs.create_file("a").unwrap();
+        let fd = fs.open("a").unwrap();
+        fs.truncate("a", 2 * BLOCK_SIZE as u64).unwrap();
+
+        let mut buf = [0xFFu8; 2 * BLOCK_SIZE];
+        let n = fs.read(fd, &mut buf).unwrap();
+
+        assert_eq!(n, 2 * BLOCK_SIZE as u64);
+        assert!(buf.iter().all(|&b| b == 0));
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn truncate_grow_keeps_old_data_and_zero_fills(){
+        let image = temp_image("truncate_grow_keeps_old_data_and_zero_fills");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        fs.create_file("a").unwrap();
+        let fd = fs.open("a").unwrap();
+        fs.write(fd, "Hello".as_bytes()).unwrap();
+        let blocks_after_write = fs.superblock.free_blocks;
+
+        fs.truncate("a", 3 * BLOCK_SIZE as u64).unwrap();
+
+        assert_eq!(fs.superblock.free_blocks, blocks_after_write);
+
+        fs.seek(fd, 0).unwrap();
+        let mut buf = [0xFFu8; 3 * BLOCK_SIZE];
+        let n = fs.read(fd, &mut buf).unwrap();
+
+        assert_eq!(n, 3 * BLOCK_SIZE as u64);
+        assert_eq!(&buf[..5], b"Hello");
+        assert!(buf[5..].iter().all(|&b| b == 0));
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn truncate_shrink_frees_blocks_and_keeps_head(){
+        let image = temp_image("truncate_shrink_frees_blocks_and_keeps_head");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        fs.create_file("a").unwrap();
+        let fd = fs.open("a").unwrap();
+        let blocks_before = fs.superblock.free_blocks;
+
+        let data = [0xAAu8; 3*BLOCK_SIZE];
+        fs.write(fd, &data).unwrap();
+        assert_eq!(fs.superblock.free_blocks, blocks_before - 3);
+
+        let new_size = BLOCK_SIZE + 10;
+        fs.truncate("a", new_size as u64).unwrap();
+
+        assert_eq!(fs.stat_file("a").unwrap().size, new_size as u64);
+        assert_eq!(fs.superblock.free_blocks, blocks_before - 2);
+
+        fs.seek(fd, 0).unwrap();
+        let mut buf = [0u8; 3 * BLOCK_SIZE];
+        let n = fs.read(fd, &mut buf).unwrap();
+
+        assert_eq!(n, new_size as u64);
+        assert_eq!(&buf[..new_size], &data[..new_size]);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn truncate_to_zero_frees_all_blocks(){
+        let image = temp_image("truncate_to_zero_frees_all_blocks");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        fs.create_file("a").unwrap();
+        let fd = fs.open("a").unwrap();
+        let blocks_before = fs.superblock.free_blocks;
+
+        fs.write(fd, &vec![7u8; 3 * BLOCK_SIZE]).unwrap();
+        fs.truncate("a", 0).unwrap();
+
+        let inode = fs.stat_file("a").unwrap();
+        assert_eq!(inode.size, 0);
+        assert_eq!(inode.direct, [0u32; 12]);
+        assert_eq!(inode.nlink, 1);
+        assert_eq!(fs.superblock.free_blocks, blocks_before);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn truncate_shrink_frees_indirect_block_too(){
+        let image = temp_image("truncate_shrink_frees_indirect_block_too");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        fs.create_file("a").unwrap();
+        let fd = fs.open("a").unwrap();
+        let blocks_before = fs.superblock.free_blocks;
+
+        fs.write(fd, &[1u8; 20 * BLOCK_SIZE]).unwrap();
+        assert_eq!(fs.superblock.free_blocks, blocks_before - 21);
+
+        fs.truncate("a", 5 * BLOCK_SIZE as u64).unwrap();
+        assert_eq!(fs.superblock.free_blocks, blocks_before - 5);
+        assert_eq!(fs.stat_file("a").unwrap().single_indirect, 0);
+
+        fs.truncate("a", 0).unwrap();
+        assert_eq!(fs.superblock.free_blocks, blocks_before);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn truncate_to_same_size_changes_nothing(){
+        let image = temp_image("truncate_to_same_size_changes_nothing");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        fs.create_file("a").unwrap();
+        let fd = fs.open("a").unwrap();
+        fs.write(fd, b"Hello").unwrap();
+
+        let inode_before = fs.stat_file("a").unwrap();
+        let blocks_before = fs.superblock.free_blocks;
+
+        fs.truncate("a", 5).unwrap();
+
+        assert_eq!(fs.stat_file("a").unwrap(), inode_before);
+        assert_eq!(fs.superblock.free_blocks, blocks_before);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn truncate_returns_errors_and_changes_nothing(){
+        let image = temp_image("truncate_returns_errors_and_changes_nothing");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        fs.create_file("a").unwrap();
+        let fd = fs.open("a").unwrap();
+        fs.write(fd, b"Hello").unwrap();
+
+        let inode_before = fs.stat_file("a").unwrap();
+        let root_before = fs.stat_file(".").unwrap();
+        let blocks_before = fs.superblock.free_blocks;
+
+        assert_eq!(fs.truncate("nope", 10), Err(FsError::ENOENT));
+        assert_eq!(fs.truncate(".", 0), Err(FsError::EISDIR));
+        assert_eq!(fs.truncate("..", 0), Err(FsError::EISDIR));
+        assert_eq!(fs.truncate("a", u64::MAX), Err(FsError::EFBIG));
+
+        assert_eq!(fs.stat_file("a").unwrap(), inode_before);
+        assert_eq!(fs.stat_file(".").unwrap(), root_before);
+        assert_eq!(fs.superblock.free_blocks, blocks_before);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn truncate_with_two_names_changes_both(){
+        let image = temp_image("truncate_with_two_names_changes_both");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        fs.create_file("a").unwrap();
+        fs.link("a", "b").unwrap();
+
+        fs.truncate("b", 777).unwrap();
+
+        assert_eq!(fs.stat_file("a").unwrap().size, 777);
+        assert_eq!(fs.stat_file("b").unwrap().size, 777);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn unlink_and_close_after_truncate_free_everything(){
+        let image = temp_image("unlink_and_close_after_truncate_free_everything");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        let inodes_before = fs.superblock.free_inodes;
+        let blocks_before = fs.superblock.free_blocks;
+
+        fs.create_file("a").unwrap();
+        let fd = fs.open("a").unwrap();
+        fs.write(fd, &[3u8; 4 * BLOCK_SIZE]).unwrap();
+        fs.truncate("a", 2 * BLOCK_SIZE as u64).unwrap();
+        fs.truncate("a", 6 * BLOCK_SIZE as u64).unwrap();
+
+        fs.unlink("a").unwrap();
+        fs.close(fd).unwrap();
+
+        assert_eq!(fs.superblock.free_inodes, inodes_before);
+        assert_eq!(fs.superblock.free_blocks, blocks_before);
         assert_eq!(fs.pool.in_use(), 0);
     }
 }
