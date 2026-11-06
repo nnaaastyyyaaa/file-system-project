@@ -15,12 +15,13 @@ pub struct Fs <D: RawDevice> {
     pub pool: BufferPooll,
     pub opened_files: Vec<Option<OpenedFile>>,
     pub opened_inodes: HashMap<u32, u32>,
+    pub cwd: u32,
 }
 
 impl <D: RawDevice> Fs<D> {
     pub fn format_fs(mut device: D, pool: BufferPooll, inode_count: Option<u32>) -> FsResult<Self> {
        let superblock = mkfs(&pool, &mut device, inode_count)?;
-        Ok(Self {device, superblock, pool, opened_files: Vec::new(), opened_inodes: HashMap::new() })
+        Ok(Self {device, superblock, pool, opened_files: Vec::new(), opened_inodes: HashMap::new(), cwd: ROOT_INODE })
     }
 
     pub fn create_file(&mut self, name: &str) -> FsResult<u32> {
@@ -236,6 +237,7 @@ mod tests{
         let pool = BufferPooll::new();
         let fs = Fs::format_fs(device, pool, Some(128)).unwrap();
 
+        assert_eq!(fs.cwd, 1);
         assert_eq!(fs.superblock.total_inodes, 128);
         assert_eq!(fs.superblock.free_inodes, fs.superblock.total_inodes - 1);
         assert_eq!(fs.superblock.free_blocks, fs.superblock.data_table_blocks - 1);
