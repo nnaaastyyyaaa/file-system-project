@@ -1,6 +1,6 @@
 use std::{collections::HashMap};
 
-use crate::{alloc::{alloc_inode, free_inode}, directory::{add_entry, lookup, remove_entry}, error::{FsError, FsResult}, file_io::{read_file, truncate_file, write_file}, inode::{Inode, Type, now_ms}, inode_table, mem::BufferPooll, mkfs::mkfs, raw_device::RawDevice, superblock::{ROOT_INODE, Superblock}};
+use crate::{alloc::{alloc_inode, free_inode}, directory::{add_entry, lookup, remove_entry}, error::{FsError, FsResult}, file_io::{read_file, truncate_file, write_file}, inode::{Inode, Type, now_ms}, inode_table, mem::BufferPooll, mkfs::mkfs, path::resolve_parent, raw_device::RawDevice, superblock::{ROOT_INODE, Superblock}};
 
 const MAX_OPEN_FILES: usize = 64; 
 
@@ -24,9 +24,14 @@ impl <D: RawDevice> Fs<D> {
         Ok(Self {device, superblock, pool, opened_files: Vec::new(), opened_inodes: HashMap::new(), cwd: ROOT_INODE })
     }
 
-    pub fn create_file(&mut self, name: &str) -> FsResult<u32> {
+    pub fn create_file(&mut self, path: &str) -> FsResult<u32> {
+        if path.ends_with("/"){
+            return Err(FsError::EINVAL)
+        }
 
-        let mut root_inode = inode_table::read(ROOT_INODE, &mut self.device, &self.superblock, &self.pool)?;
+        let (name, id) = resolve_parent(&mut self.device, &self.pool, &mut self.superblock, self.cwd, path)?;
+
+        let mut parent_inode = inode_table::read(id, &mut self.device, &self.superblock, &self.pool)?;
         let inode_id = alloc_inode(&mut self.superblock, &self.pool, &mut self.device)?;
         let now = now_ms();
 
@@ -38,7 +43,7 @@ impl <D: RawDevice> Fs<D> {
         inode.ctime = now;
 
         inode_table::write(&inode, &mut self.device, &self.superblock, &self.pool)?;
-        let result = add_entry(&mut self.device, &mut self.superblock, &mut root_inode, &self.pool, inode_id, name);
+        let result = add_entry(&mut self.device, &mut self.superblock, &mut parent_inode, &self.pool, inode_id, &name);
 
         match result {
             Ok(_) => {},
@@ -52,9 +57,10 @@ impl <D: RawDevice> Fs<D> {
         Ok(inode_id)
     }
 
-    pub fn stat_file(&mut self, name: &str) -> FsResult<Inode> {
-        let mut root_inode = inode_table::read(ROOT_INODE, &mut self.device, &self.superblock, &self.pool)?;
-        let id = match lookup(&mut self.device, &mut self.superblock, &mut root_inode, &self.pool, name) {
+    pub fn stat_file(&mut self, path: &str) -> FsResult<Inode> {
+        let (name, parent_id) = resolve_parent(&mut self.device, &self.pool, &mut self.superblock, self.cwd, path)?;
+        let mut parent_inode = inode_table::read(parent_id, &mut self.device, &self.superblock, &self.pool)?;
+        let id = match lookup(&mut self.device, &mut self.superblock, &mut parent_inode, &self.pool, &name) {
             Ok(id) => id,
             Err(e) => return Err(e),
             
@@ -63,16 +69,28 @@ impl <D: RawDevice> Fs<D> {
         Ok(inode)
     }
 
-    pub fn ls(&mut self) -> FsResult<Vec<(u32, String)>> {
-        let mut root_inode = inode_table::read(ROOT_INODE, &mut self.device, &self.superblock, &self.pool)?;
-        let entries = crate::directory::list(&mut self.device, &mut self.superblock, &mut root_inode, &self.pool)?;
+    pub fn ls(&mut self, path: &str) -> FsResult<Vec<(u32, String)>> {
+        let mut parent_inode;
+        if path.is_empty() {
+            parent_inode = inode_table::read(self.cwd, &mut self.device, &self.superblock, &self.pool)?;
+        } else {
+            let (_name, parent_id) = resolve_parent(&mut self.device, &self.pool, &mut self.superblock, self.cwd, path)?;
+            parent_inode = inode_table::read(parent_id, &mut self.device, &self.superblock, &self.pool)?;
+        }
+        let entries = crate::directory::list(&mut self.device, &mut self.superblock, &mut parent_inode, &self.pool)?;
         Ok(entries)
     }
 
-    pub fn link(&mut self, name1: &str, name2: &str) -> FsResult<()> {
-        let mut root_inode = inode_table::read(ROOT_INODE, &mut self.device, &self.superblock, &self.pool)?;
+    pub fn link(&mut self, path1: &str, path2: &str) -> FsResult<()> {
+        if path2.ends_with("/"){
+            return Err(FsError::EINVAL);
+        }
 
-        let mut inode = match self.stat_file(name1){
+        let (name2, parent2_id) = resolve_parent(&mut self.device, &self.pool, &mut self.superblock, self.cwd, path2)?;
+
+        let mut parent2_inode = inode_table::read(parent2_id, &mut self.device, &self.superblock, &self.pool)?;
+
+        let mut inode = match self.stat_file(path1){
             Ok(inode) => inode,
             Err(e) => return Err(e),
         };
@@ -85,7 +103,7 @@ impl <D: RawDevice> Fs<D> {
         inode.nlink = inode.nlink.checked_add(1).ok_or(FsError::CORRUPT)?;
         inode.mtime = now_ms();
         inode_table::write(&inode, &mut self.device, &self.superblock, &self.pool)?;
-        let result = add_entry(&mut self.device, &mut self.superblock, &mut root_inode, &self.pool, inode.id, name2);
+        let result = add_entry(&mut self.device, &mut self.superblock, &mut parent2_inode, &self.pool, inode.id, &name2);
 
         match result {
             Ok(_) => {},
@@ -114,14 +132,15 @@ impl <D: RawDevice> Fs<D> {
         Ok(())
     }
 
-    pub fn unlink(&mut self, name: &str) -> FsResult<()>{
-        let mut root_inode = inode_table::read(ROOT_INODE, &mut self.device, &mut self.superblock, &self.pool)?;
-        let mut inode = self.stat_file(name)?;
+    pub fn unlink(&mut self, path: &str) -> FsResult<()>{
+        let (name, parent_id) = resolve_parent(&mut self.device, &self.pool, &mut self.superblock, self.cwd, path)?;
+        let mut parent_inode = inode_table::read(parent_id, &mut self.device, &mut self.superblock, &self.pool)?;
+        let mut inode = self.stat_file(path)?;
         let now = now_ms();
 
         inode.nlink = inode.nlink.checked_sub(1).ok_or(FsError::CORRUPT)?;
         inode.ctime = now;
-        remove_entry(&mut self.device, &mut self.superblock, &mut root_inode, &self.pool, name)?;
+        remove_entry(&mut self.device, &mut self.superblock, &mut parent_inode, &self.pool, &name)?;
         inode_table::write(&inode, &mut self.device, &mut self.superblock,  &self.pool)?;
 
         self.maybe_free(inode.id)?;
@@ -129,8 +148,8 @@ impl <D: RawDevice> Fs<D> {
         Ok(())
     }
 
-    pub fn open(&mut self, name: &str) -> FsResult<usize>{
-        let inode = self.stat_file(name)?;
+    pub fn open(&mut self, path: &str) -> FsResult<usize>{
+        let inode = self.stat_file(path)?;
         if inode.inode_type != Type::File {
             return Err(FsError::EISDIR)
         }
@@ -212,8 +231,8 @@ impl <D: RawDevice> Fs<D> {
         Ok(read)
     }
 
-    pub fn truncate(&mut self, name: &str, size: u64) -> FsResult<()>{
-        let mut inode = self.stat_file(name)?;
+    pub fn truncate(&mut self, path: &str, size: u64) -> FsResult<()>{
+        let mut inode = self.stat_file(path)?;
 
         if inode.inode_type != Type::File{
             return Err(FsError::EISDIR);
@@ -228,7 +247,7 @@ impl <D: RawDevice> Fs<D> {
 #[cfg(test)]
 mod tests{
     use super::*;
-    use crate::{directory::{list, lookup}, dirent::ENTRY_SIZE, error::FsError, file_io::read_file, inode::Type, inode_table, mem::BufferPooll, raw_device::{BLOCK_SIZE, FileDevice}, superblock::ROOT_INODE, test_utils::{MIB, temp_image}};
+    use crate::{directory::{list, lookup}, dirent::ENTRY_SIZE, error::FsError, inode::Type, inode_table, mem::BufferPooll, raw_device::{BLOCK_SIZE, FileDevice}, superblock::ROOT_INODE, test_utils::{MIB, temp_image}};
 
     #[test]
     fn test_format(){
@@ -382,7 +401,7 @@ mod tests{
 
         assert_eq!(fs.create_file(""), Err(FsError::EINVAL));
         assert_eq!(fs.create_file(&"a".repeat(65)), Err(FsError::ENAMETOOLONG));
-        assert_eq!(fs.create_file("a/b"), Err(FsError::EINVAL));
+        assert_eq!(fs.create_file("a/"), Err(FsError::EINVAL));
     }
 
     #[test]
@@ -498,7 +517,7 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, Some(128)).unwrap();
 
-        let entries = fs.ls().unwrap();
+        let entries = fs.ls("").unwrap();
 
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0], (1, ".".to_string()));
@@ -515,7 +534,7 @@ mod tests{
 
         let a = fs.create_file("a").unwrap();
         let b = fs.create_file("b").unwrap();
-        let entries = fs.ls().unwrap();
+        let entries = fs.ls("").unwrap();
 
         assert_eq!(entries.len(), 4);
         assert_eq!(entries[2], (a, "a".to_string()));
@@ -548,7 +567,7 @@ mod tests{
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
         assert_eq!(fs.link("data", "new_data"), Err(FsError::ENOENT));
-        let entries = fs.ls().unwrap();
+        let entries = fs.ls("").unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(fs.pool.in_use(), 0);
     }
@@ -592,7 +611,7 @@ mod tests{
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
         fs.create_file("data").unwrap();
-        assert_eq!(fs.link("data", "new/data"), Err(FsError::EINVAL));
+        assert_eq!(fs.link("data", "new/data"), Err(FsError::ENOENT));
         assert_eq!(fs.link("data", ""), Err(FsError::EINVAL));
 
         let inode = fs.stat_file("data").unwrap();
@@ -662,7 +681,7 @@ mod tests{
         assert_eq!(fs.superblock.free_blocks, blocks_before);
         assert_eq!(fs.superblock.free_inodes, inodes_before);
 
-        let entries = fs.ls().unwrap();
+        let entries = fs.ls("").unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[2], (id, "one_more_name".to_string()));
         assert_eq!(fs.pool.in_use(), 0);
@@ -1015,7 +1034,7 @@ mod tests{
         assert!(fs.opened_inodes.is_empty());
         assert_eq!(fs.superblock.free_inodes, inodes_before + 1);
         assert_eq!(fs.superblock.free_blocks, blocks_before);
-        assert_eq!(fs.ls().unwrap().len(), 2);
+        assert_eq!(fs.ls("").unwrap().len(), 2);
         assert_eq!(fs.pool.in_use(), 0);
     }
 

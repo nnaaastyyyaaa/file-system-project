@@ -1,6 +1,6 @@
 use crate::{directory::lookup, error::{FsError, FsResult}, inode::{Inode, Type}, inode_table, mem::BufferPooll, raw_device::RawDevice, superblock::{ROOT_INODE, Superblock}};
 
-fn resolve_start_dir<'a, D: RawDevice>(device: &mut D, pool: &BufferPooll, superblock: &mut Superblock, cwd: u32, path: &str) -> FsResult<Inode> {
+fn resolve_start_dir<D: RawDevice>(device: &mut D, pool: &BufferPooll, superblock: &mut Superblock, cwd: u32, path: &str) -> FsResult<Inode> {
     let start_dir =
     if path.starts_with("/"){
          ROOT_INODE
@@ -13,9 +13,9 @@ fn resolve_start_dir<'a, D: RawDevice>(device: &mut D, pool: &BufferPooll, super
     Ok(inode)
 }
 
-fn resolve_path<'a, D: RawDevice>(device: &mut D, pool: &BufferPooll, superblock: &mut Superblock, start: Inode, path: &'a str) -> FsResult<(Inode, Vec<&'a str>)>{
-    let mut components:Vec<&'a str> = path.split('/').collect();
-    components = components.iter().copied().filter(|el| !el.is_empty()).collect();
+fn resolve_path< D: RawDevice>(device: &mut D, pool: &BufferPooll, superblock: &mut Superblock, start: Inode, path: &str) -> FsResult<(Inode, Vec<String>)>{
+    let mut components:Vec<String> = path.split('/').map(|el|String::from(el)).collect();
+    components = components.iter().cloned().filter(|el| !el.is_empty()).collect();
 
     let len = components.len();
     if len == 0 {
@@ -31,7 +31,7 @@ fn resolve_path<'a, D: RawDevice>(device: &mut D, pool: &BufferPooll, superblock
         if curr_inode.inode_type != Type::Dir {
             return Err(FsError::ENOTDIR);
         }
-        let dir = components[n];
+        let dir = &components[n];
         let id  = lookup(device, superblock, &mut curr_inode, pool, dir)?;
         curr_inode = inode_table::read(id, device, superblock, pool)?;
     }
@@ -41,45 +41,39 @@ fn resolve_path<'a, D: RawDevice>(device: &mut D, pool: &BufferPooll, superblock
     Ok((curr_inode, components))
 }
 
-pub fn resolve_parent<'a, D: RawDevice>(cwd: u32, device: &mut D, pool: &BufferPooll, superblock: &mut Superblock, path: &'a str) -> FsResult<(Option<&'a str>, u32)>{
+pub fn resolve_parent<D: RawDevice>(device: &mut D, pool: &BufferPooll, superblock: &mut Superblock,cwd: u32, path: &str) -> FsResult<(String, u32)>{
+
     let start_dir = resolve_start_dir(device, pool, superblock , cwd, path )?;
     let (current_inode, components) = resolve_path(device, pool, superblock, start_dir, path)?;
 
     if components.is_empty() {
-        return Ok((None, current_inode.id));
+        if path.starts_with('/') {
+            return Ok((".".to_string(), ROOT_INODE));
+        }
+        return Err(FsError::EINVAL);
     }
 
-    let file: Option<&'a str> = Some(components[components.len() - 1]);
+    let file = String::from(components[components.len() - 1].clone());
     
     Ok((file, current_inode.id))
 }
 
-pub fn resolve_full<'a, D: RawDevice>(device: &mut D, pool: &BufferPooll, superblock: &mut Superblock, cwd: u32, path: &str) -> FsResult<u32>{
+pub fn resolve_full<D: RawDevice>(device: &mut D, pool: &BufferPooll, superblock: &mut Superblock, cwd: u32, path: &str) -> FsResult<u32>{
     let start_dir = resolve_start_dir(device, pool, superblock , cwd, path )?;
     let (mut current_inode, components) = resolve_path(device, pool, superblock, start_dir, path)?;
 
     if components.is_empty() {
-        return Err(FsError::EISDIR);
+        if path.starts_with('/') {
+            return Ok(ROOT_INODE);
+        }
+        return Err(FsError::EINVAL);
     }
 
-    let file  = Some(components[components.len() - 1]).unwrap();
+    let file  = Some(components[components.len() - 1].clone()).unwrap();
 
-    let id = lookup(device, superblock, &mut current_inode, pool, file)?;
-    let inode = inode_table::read(id, device, superblock, pool)?;
-    if inode.inode_type != Type::File {
-        return  Err(FsError::EISDIR);
-    }
+    let id = lookup(device, superblock, &mut current_inode, pool, &file)?;
     Ok(id)
 }
-
-// Вставте в кінець файлу з resolve_parent / resolve_full.
-// Дерево, яке будує setup():
-//   /
-//   ├── top        (file)
-//   └── a/         (dir)
-//       ├── g      (file)
-//       └── b/     (dir)
-//           └── f  (file)
 
 #[cfg(test)]
 mod tests {
@@ -131,49 +125,49 @@ mod tests {
     #[test]
     fn parent_single_component_absolute() {
         let (mut d, pool, mut sb, _t) = setup("rp_single_abs");
-        let r = resolve_parent(ROOT_INODE, &mut d, &pool, &mut sb, "/top");
-        assert_eq!(r, Ok((Some("top"), ROOT_INODE)));
+        let r = resolve_parent(&mut d, &pool, &mut sb, ROOT_INODE, "/top");
+        assert_eq!(r, Ok(("top".to_string(), ROOT_INODE)));
         assert_eq!(pool.in_use(), 0);
     }
 
     #[test]
     fn parent_nested_absolute() {
         let (mut d, pool, mut sb, t) = setup("rp_nested_abs");
-        let r = resolve_parent(ROOT_INODE, &mut d, &pool, &mut sb, "/a/b/f");
-        assert_eq!(r, Ok((Some("f"), t.b)));
+        let r = resolve_parent(&mut d, &pool, &mut sb, ROOT_INODE,  "/a/b/f");
+        assert_eq!(r, Ok(("f".to_string(), t.b)));
         assert_eq!(pool.in_use(), 0);
     }
 
     #[test]
     fn parent_nested_relative_from_cwd() {
         let (mut d, pool, mut sb, t) = setup("rp_nested_rel");
-        let r = resolve_parent(t.a, &mut d, &pool, &mut sb, "b/f");
-        assert_eq!(r, Ok((Some("f"), t.b)));
+        let r = resolve_parent( &mut d, &pool, &mut sb, t.a, "b/f");
+        assert_eq!(r, Ok(("f".to_string(), t.b)));
         assert_eq!(pool.in_use(), 0);
     }
 
     #[test]
     fn parent_absolute_ignores_cwd() {
         let (mut d, pool, mut sb, t) = setup("rp_abs_ignores_cwd");
-        let r = resolve_parent(t.b, &mut d, &pool, &mut sb, "/top");
-        assert_eq!(r, Ok((Some("top"), ROOT_INODE)));
+        let r = resolve_parent(&mut d, &pool, &mut sb, t.b,  "/top");
+        assert_eq!(r, Ok(("top".to_string(), ROOT_INODE)));
         assert_eq!(pool.in_use(), 0);
     }
 
     #[test]
     fn parent_extra_and_trailing_slashes() {
         let (mut d, pool, mut sb, t) = setup("rp_slashes");
-        let r = resolve_parent(ROOT_INODE, &mut d, &pool, &mut sb, "//a///b//");
-        assert_eq!(r, Ok((Some("b"), t.a)));
+        let r = resolve_parent( &mut d, &pool, &mut sb, ROOT_INODE, "//a///b//");
+        assert_eq!(r, Ok(("b".to_string(), t.a)));
         assert_eq!(pool.in_use(), 0);
     }
 
     #[test]
-    fn parent_empty_and_root_path_give_none() {
+    fn parent_empty_and_root_works_correctly() {
         let (mut d, pool, mut sb, t) = setup("rp_empty_root");
-        assert_eq!(resolve_parent(t.a, &mut d, &pool, &mut sb, ""), Ok((None, t.a)));
-        assert_eq!(resolve_parent(t.a, &mut d, &pool, &mut sb, "/"), Ok((None, ROOT_INODE)));
-        assert_eq!(resolve_parent(t.a, &mut d, &pool, &mut sb, "///"), Ok((None, ROOT_INODE)));
+        assert_eq!(resolve_parent(&mut d, &pool, &mut sb, t.a, ""), Err(FsError::EINVAL));
+        assert_eq!(resolve_parent(&mut d, &pool, &mut sb, t.a, "/"), Ok((".".to_string(), ROOT_INODE)));
+        assert_eq!(resolve_parent(&mut d, &pool, &mut sb, t.a, "///"), Ok((".".to_string(), ROOT_INODE)));
         assert_eq!(pool.in_use(), 0);
     }
 
@@ -181,11 +175,11 @@ mod tests {
     fn parent_missing_intermediate_is_enoent() {
         let (mut d, pool, mut sb, _t) = setup("rp_missing_mid");
         assert_eq!(
-            resolve_parent(ROOT_INODE, &mut d, &pool, &mut sb, "/nope/x"),
+            resolve_parent(&mut d, &pool, &mut sb, ROOT_INODE, "/nope/x"),
             Err(FsError::ENOENT)
         );
         assert_eq!(
-            resolve_parent(ROOT_INODE, &mut d, &pool, &mut sb, "/a/nope/x/y"),
+            resolve_parent(&mut d, &pool, &mut sb, ROOT_INODE, "/a/nope/x/y"),
             Err(FsError::ENOENT)
         );
         assert_eq!(pool.in_use(), 0);
@@ -195,7 +189,7 @@ mod tests {
     fn parent_cwd_is_file_is_enotdir() {
         let (mut d, pool, mut sb, t) = setup("rp_cwd_file");
         assert_eq!(
-            resolve_parent(t.top, &mut d, &pool, &mut sb, "x"),
+            resolve_parent(&mut d, &pool, &mut sb, t.top, "x"),
             Err(FsError::ENOTDIR)
         );
         assert_eq!(pool.in_use(), 0);
@@ -204,16 +198,16 @@ mod tests {
     #[test]
     fn parent_follows_dotdot() {
         let (mut d, pool, mut sb, t) = setup("rp_dotdot");
-        let r = resolve_parent(ROOT_INODE, &mut d, &pool, &mut sb, "/a/b/../g");
-        assert_eq!(r, Ok((Some("g"), t.a)));
+        let r = resolve_parent( &mut d, &pool, &mut sb, ROOT_INODE, "/a/b/../g");
+        assert_eq!(r, Ok(("g".to_string(), t.a)));
         assert_eq!(pool.in_use(), 0);
     }
 
     #[test]
     fn parent_follows_dot() {
         let (mut d, pool, mut sb, t) = setup("rp_dot");
-        let r = resolve_parent(t.a, &mut d, &pool, &mut sb, "./b/./f");
-        assert_eq!(r, Ok((Some("f"), t.b)));
+        let r = resolve_parent( &mut d, &pool, &mut sb, t.a, "./b/./f");
+        assert_eq!(r, Ok(("f".to_string(), t.b)));
         assert_eq!(pool.in_use(), 0);
     }
 
@@ -259,24 +253,24 @@ mod tests {
     }
 
     #[test]
-    fn full_directory_is_eisdir() {
-        let (mut d, pool, mut sb, _t) = setup("rf_dir");
+    fn full_directory_return_id() {
+        let (mut d, pool, mut sb, t) = setup("rf_dir");
         assert_eq!(
-            resolve_full(&mut d, &pool, &mut sb, ROOT_INODE, "/a"),
-            Err(FsError::EISDIR)
+            resolve_full(&mut d, &pool, &mut sb, ROOT_INODE, "/a").unwrap(),
+            t.a
         );
         assert_eq!(
-            resolve_full(&mut d, &pool, &mut sb, ROOT_INODE, "/a/b/"),
-            Err(FsError::EISDIR)
+            resolve_full(&mut d, &pool, &mut sb, ROOT_INODE, "/a/b/").unwrap(),
+            t.b
         );
         assert_eq!(pool.in_use(), 0);
     }
 
     #[test]
-    fn full_empty_and_root_return_error() {
+    fn full_empty_and_return_error_root_retun_root_id() {
         let (mut d, pool, mut sb, t) = setup("rf_empty_root");
-        assert_eq!(resolve_full(&mut d, &pool, &mut sb, t.a, ""), Err(FsError::EISDIR));
-        assert_eq!(resolve_full(&mut d, &pool, &mut sb, t.a, "/"), Err(FsError::EISDIR));
+        assert_eq!(resolve_full(&mut d, &pool, &mut sb, t.a, ""), Err(FsError::EINVAL));
+        assert_eq!(resolve_full(&mut d, &pool, &mut sb, t.a, "/").unwrap(), ROOT_INODE);
         assert_eq!(pool.in_use(), 0);
     }
 
