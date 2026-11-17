@@ -79,48 +79,8 @@ pub fn resolve_full<D: RawDevice>(device: &mut D, pool: &BufferPooll, superblock
 mod tests {
     use super::*;
     use crate::{
-        alloc::alloc_inode,
-        directory::add_entry,
-        raw_device::FileDevice,
-        test_utils::{MIB, full_image},
+        test_utils::{setup},
     };
-
-    struct Tree {
-        a: u32,
-        b: u32,
-        f: u32,
-        g: u32,
-        top: u32,
-    }
-
-    fn mk_node<D: RawDevice>(device: &mut D, pool: &BufferPooll, sb: &mut Superblock, parent: u32, name: &str, kind: Type,) -> u32 {
-        let id = alloc_inode(sb, pool, device).unwrap();
-        let mut inode = Inode::empty(id);
-        inode.inode_type = kind;
-        inode.nlink = 1;
-        inode.mode = 0o755;
-        inode_table::write(&inode, device, sb, pool).unwrap();
-
-        if kind == Type::Dir {
-            add_entry(device, sb, &mut inode, pool, id, ".").unwrap();
-            add_entry(device, sb, &mut inode, pool, parent, "..").unwrap();
-        }
-
-        let mut p = inode_table::read(parent, device, sb, pool).unwrap();
-        add_entry(device, sb, &mut p, pool, id, name).unwrap();
-        id
-    }
-
-    fn setup(name: &str) -> (FileDevice, BufferPooll, Superblock, Tree) {
-        let (mut device, pool, mut sb) = full_image(name, 4 * MIB);
-        let top = mk_node(&mut device, &pool, &mut sb, ROOT_INODE, "top", Type::File);
-        let a = mk_node(&mut device, &pool, &mut sb, ROOT_INODE, "a", Type::Dir);
-        let g = mk_node(&mut device, &pool, &mut sb, a, "g", Type::File);
-        let b = mk_node(&mut device, &pool, &mut sb, a, "b", Type::Dir);
-        let f = mk_node(&mut device, &pool, &mut sb, b, "f", Type::File);
-        assert_eq!(pool.in_use(), 0);
-        (device, pool, sb, Tree { a, b, f, g, top })
-    }
 
     #[test]
     fn parent_single_component_absolute() {

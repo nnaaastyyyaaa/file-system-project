@@ -1,6 +1,6 @@
 use std::{env::temp_dir, path::PathBuf, process::id};
 
-use crate::{ inode::{DIRECT_POINTERS, Inode, Type},  mem::BufferPooll, mkfs::mkfs, raw_device::{FileDevice}, superblock::Superblock};
+use crate::{ alloc::alloc_inode, directory::add_entry, inode::{DIRECT_POINTERS, Inode, Type}, inode_table, mem::BufferPooll, mkfs::mkfs, raw_device::{FileDevice, RawDevice}, superblock::{ROOT_INODE, Superblock}};
 pub const MIB: u64 = 1024 * 1024;
 
 pub fn temp_image(name: &str) -> PathBuf{
@@ -39,3 +39,49 @@ pub fn inode(id: u32) -> Inode
         double_indirect: 257 
     }
 }
+
+    pub struct Tree {
+       pub a: u32,
+       pub b: u32,
+       pub f: u32,
+       pub g: u32,
+       pub top: u32,
+    }
+
+    pub fn mk_node<D: RawDevice>(device: &mut D, pool: &BufferPooll, sb: &mut Superblock, parent: u32, name: &str, kind: Type,) -> u32 {
+        let id = alloc_inode(sb, pool, device).unwrap();
+        let mut inode = Inode::empty(id);
+        inode.inode_type = kind;
+        inode.nlink = 1;
+        inode.mode = 0o755;
+        inode_table::write(&inode, device, sb, pool).unwrap();
+
+        if kind == Type::Dir {
+            add_entry(device, sb, &mut inode, pool, id, ".").unwrap();
+            add_entry(device, sb, &mut inode, pool, parent, "..").unwrap();
+        }
+
+        let mut p = inode_table::read(parent, device, sb, pool).unwrap();
+        add_entry(device, sb, &mut p, pool, id, name).unwrap();
+        id
+    }
+
+    pub fn setup(name: &str) -> (FileDevice, BufferPooll, Superblock, Tree) {
+        let (mut device, pool, mut sb) = full_image(name, 4 * MIB);
+        let top = mk_node(&mut device, &pool, &mut sb, ROOT_INODE, "top", Type::File);
+        let a = mk_node(&mut device, &pool, &mut sb, ROOT_INODE, "a", Type::Dir);
+        let g = mk_node(&mut device, &pool, &mut sb, a, "g", Type::File);
+        let b = mk_node(&mut device, &pool, &mut sb, a, "b", Type::Dir);
+        let f = mk_node(&mut device, &pool, &mut sb, b, "f", Type::File);
+        assert_eq!(pool.in_use(), 0);
+        (device, pool, sb, Tree { a, b, f, g, top })
+    }
+
+    pub fn mk_node_tree<D: RawDevice>(device: &mut D, pool: &BufferPooll, sb: &mut Superblock) -> Tree {
+        let top = mk_node(device, &pool, sb, ROOT_INODE, "top", Type::File);
+        let a = mk_node(device, &pool, sb, ROOT_INODE, "a", Type::Dir);
+        let g = mk_node(device, &pool, sb, a, "g", Type::File);
+        let b = mk_node(device, &pool, sb, a, "b", Type::Dir);
+        let f = mk_node(device, &pool, sb, b, "f", Type::File);
+        Tree { a, b, f, g, top }
+    }
