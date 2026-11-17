@@ -1,4 +1,4 @@
-use crate::{directory::lookup, error::{FsError, FsResult}, inode::{Inode, Type}, inode_table, mem::BufferPooll, raw_device::RawDevice, superblock::{ROOT_INODE, Superblock}};
+use crate::{directory::lookup, error::{FsError, FsResult}, file_io::read_file, inode::{Inode, Type}, inode_table, mem::BufferPooll, raw_device::{BLOCK_SIZE, RawDevice}, superblock::{ROOT_INODE, Superblock}};
 
 fn resolve_start_dir<D: RawDevice>(device: &mut D, pool: &BufferPooll, superblock: &mut Superblock, cwd: u32, path: &str) -> FsResult<Inode> {
     let start_dir =
@@ -13,7 +13,7 @@ fn resolve_start_dir<D: RawDevice>(device: &mut D, pool: &BufferPooll, superbloc
     Ok(inode)
 }
 
-fn resolve_path< D: RawDevice>(device: &mut D, pool: &BufferPooll, superblock: &mut Superblock, start: Inode, path: &str) -> FsResult<(Inode, Vec<String>)>{
+fn resolve_path< D: RawDevice>(device: &mut D, pool: &BufferPooll, superblock: &mut Superblock, start: Inode, path: &str, follow_last: bool) -> FsResult<(Inode, Vec<String>)>{
     let mut components:Vec<String> = path.split('/').map(|el|String::from(el)).collect();
     components = components.iter().cloned().filter(|el| !el.is_empty()).collect();
 
@@ -27,15 +27,54 @@ fn resolve_path< D: RawDevice>(device: &mut D, pool: &BufferPooll, superblock: &
         return Err(FsError::ENOTDIR);
     }
 
-    for n in 0..len - 1{
+    let mut links = 0;
+    let mut n = 0;
+
+    while components.len() > n {
+        if components.len() == n + 1 && !follow_last {
+            break;
+        }
+
         if curr_inode.inode_type != Type::Dir {
             return Err(FsError::ENOTDIR);
         }
         let dir = &components[n];
         let id  = lookup(device, superblock, &mut curr_inode, pool, dir)?;
-        curr_inode = inode_table::read(id, device, superblock, pool)?;
+        let mut next = inode_table::read(id, device, superblock, pool)?;
+        if next.inode_type == Type::Symlink {
+            links += 1;
+            if links > 40 {
+                return Err(FsError::ELOOP);
+            }
+
+            let mut buff = [0u8; BLOCK_SIZE];
+            let size = next.size as usize;
+            if size > BLOCK_SIZE {
+                return Err(FsError::CORRUPT);
+            }
+            let read = read_file(device, pool, superblock, &mut next, 0, &mut buff[0..size])?;
+            if read < size as u64 {
+                return Err(FsError::CORRUPT);
+            }
+
+            let link = String::from_utf8(buff[..size].to_vec()).map_err(|_| FsError::EINVAL)?;
+            if link.is_empty() {
+                return Err(FsError::EINVAL);
+            }
+
+            let link_components:Vec<String> = link.split('/').map(|el|String::from(el)).filter(|el| !el.is_empty()).collect();
+            if link.starts_with('/') {
+                curr_inode = inode_table::read(ROOT_INODE, device, superblock, pool)?;
+            }
+            components.splice(0..=n, link_components);
+            n = 0;
+        }else{
+            curr_inode = next;
+            n += 1;
+        }
     }
-    if curr_inode.inode_type != Type::Dir {
+
+    if !follow_last && curr_inode.inode_type != Type::Dir {
         return Err(FsError::ENOTDIR);
     }
     Ok((curr_inode, components))
@@ -44,7 +83,7 @@ fn resolve_path< D: RawDevice>(device: &mut D, pool: &BufferPooll, superblock: &
 pub fn resolve_parent<D: RawDevice>(device: &mut D, pool: &BufferPooll, superblock: &mut Superblock,cwd: u32, path: &str) -> FsResult<(String, u32)>{
 
     let start_dir = resolve_start_dir(device, pool, superblock , cwd, path )?;
-    let (current_inode, components) = resolve_path(device, pool, superblock, start_dir, path)?;
+    let (current_inode, components) = resolve_path(device, pool, superblock, start_dir, path, false)?;
 
     if components.is_empty() {
         if path.starts_with('/') {
@@ -59,20 +98,16 @@ pub fn resolve_parent<D: RawDevice>(device: &mut D, pool: &BufferPooll, superblo
 }
 
 pub fn resolve_full<D: RawDevice>(device: &mut D, pool: &BufferPooll, superblock: &mut Superblock, cwd: u32, path: &str) -> FsResult<u32>{
-    let start_dir = resolve_start_dir(device, pool, superblock , cwd, path )?;
-    let (mut current_inode, components) = resolve_path(device, pool, superblock, start_dir, path)?;
-
-    if components.is_empty() {
-        if path.starts_with('/') {
-            return Ok(ROOT_INODE);
-        }
-        return Err(FsError::EINVAL);
+    if path.split('/').all(|c| c.is_empty()) {
+        if path.starts_with('/') { 
+            return Ok(ROOT_INODE) 
+        } else { 
+            return Err(FsError::EINVAL) 
+        };
     }
-
-    let file  = Some(components[components.len() - 1].clone()).unwrap();
-
-    let id = lookup(device, superblock, &mut current_inode, pool, &file)?;
-    Ok(id)
+    let start_dir = resolve_start_dir(device, pool, superblock , cwd, path )?;
+    let (current_inode, _) = resolve_path(device, pool, superblock, start_dir, path, true)?;
+    Ok(current_inode.id)
 }
 
 #[cfg(test)]

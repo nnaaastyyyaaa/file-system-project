@@ -360,6 +360,51 @@ impl <D: RawDevice> Fs<D> {
         }
         Ok(inode_id)
     }
+
+    pub fn rmdir(&mut self, path: &str) -> FsResult<()>{
+        let last = path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+        if last.is_empty() || last == "." || last == ".." {
+            return Err(FsError::EINVAL);
+        }
+
+        let (name, parent_id) = resolve_parent(&mut self.device, &self.pool, &mut self.superblock, self.cwd, path)?;
+
+        let list: Vec<(u32, String)> = self.ls(path)?.into_iter().filter(|(_, name)| name != "." && name != "..").collect();
+        if list.len() > 0 {
+            return Err(FsError::ENOTEMPTY);
+        }
+
+        let mut parent_inode = inode_table::read(parent_id, &mut self.device, &mut self.superblock, &self.pool)?;
+        let id = lookup(&mut self.device, &mut self.superblock, &mut parent_inode, &self.pool, &name)?;
+
+
+        if self.cwd == id {
+            return Err(FsError::EINVAL);
+        }
+
+        let mut inode = inode_table::read(id, &mut self.device, &mut self.superblock, &self.pool)?;
+        if inode.inode_type != Type::Dir {
+            return Err(FsError::ENOTDIR);
+        }
+
+        remove_entry(&mut self.device, &mut self.superblock, &mut parent_inode, &self.pool, &name)?;
+        truncate_file(&mut self.device, &self.pool, &mut self.superblock, &mut inode, 0)?;
+        self.make_inode_free(id);
+
+        parent_inode.nlink = parent_inode.nlink.checked_sub(1).ok_or(FsError::CORRUPT)?;
+        inode_table::write(&parent_inode, &mut self.device, &mut self.superblock, &self.pool)?;
+        Ok(())
+    }
+
+    pub fn cd(&mut self, path: &str) -> FsResult<()>{
+        let id = resolve_full(&mut self.device, &self.pool, &mut self.superblock, self.cwd, path)?;
+        let inode = inode_table::read(id, &mut self.device, &mut self.superblock, &self.pool)?;
+        if inode.inode_type != Type::Dir {
+            return Err(FsError::ENOTDIR);
+        }
+        self.cwd = id;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1919,5 +1964,241 @@ mod tests{
         inode = fs.stat_file("dir").unwrap();
 
         assert_eq!(inode.nlink, nlink_before);
+    }
+
+    #[test]
+    fn rmdir_removes_dir_and_restores_state(){
+        let image = temp_image("rmdir_removes_dir_and_restores_state");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        let inodes_before = fs.superblock.free_inodes;
+        let blocks_before = fs.superblock.free_blocks;
+        let nlink_before = fs.stat_file("/").unwrap().nlink;
+
+        let id = fs.mkdir("dir").unwrap();
+        fs.rmdir("dir").unwrap();
+
+        assert_eq!(fs.stat_file("dir"), Err(FsError::ENOENT));
+        let inode = inode_table::read(id, &mut fs.device, &fs.superblock, &fs.pool).unwrap();
+        assert_eq!(inode.inode_type, Type::Free);
+        assert_eq!(fs.superblock.free_inodes, inodes_before);
+        assert_eq!(fs.superblock.free_blocks, blocks_before);
+        assert_eq!(fs.stat_file("/").unwrap().nlink, nlink_before);
+        assert_eq!(fs.ls(".").unwrap().len(), 2);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn rmdir_allows_recreating_same_name(){
+        let image = temp_image("rmdir_allows_recreating_same_name");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        fs.mkdir("dir").unwrap();
+        fs.rmdir("dir").unwrap();
+        let id = fs.mkdir("dir").unwrap();
+
+        assert_eq!(fs.ls("dir").unwrap().len(), 2);
+        assert_eq!(fs.stat_file("dir").unwrap().inode_type, Type::Dir);
+        assert_eq!(fs.ls(".").unwrap().last().unwrap(), &(id, "dir".to_string()));
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn rmdir_non_empty_returns_enotempty_and_changes_nothing(){
+        let image = temp_image("rmdir_non_empty_returns_enotempty_and_changes_nothing");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        fs.mkdir("dir").unwrap();
+        fs.mkdir("dir/sub").unwrap();
+        fs.create_file("dir/file").unwrap();
+        fs.symlink("target", "dir/link").unwrap();
+
+        let inodes_before = fs.superblock.free_inodes;
+        let blocks_before = fs.superblock.free_blocks;
+        let nlink_before = fs.stat_file("/").unwrap().nlink;
+
+        assert_eq!(fs.rmdir("dir"), Err(FsError::ENOTEMPTY));
+        assert_eq!(fs.rmdir("dir/sub"), Ok(()));
+        assert_eq!(fs.rmdir("dir"), Err(FsError::ENOTEMPTY));
+
+        assert_eq!(fs.superblock.free_inodes, inodes_before + 1);
+        assert_eq!(fs.superblock.free_blocks, blocks_before + 1);
+        assert_eq!(fs.stat_file("/").unwrap().nlink, nlink_before);
+        assert_eq!(fs.ls("dir").unwrap().len(), 4);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn rmdir_on_file_and_symlink_returns_enotdir(){
+        let image = temp_image("rmdir_on_file_and_symlink_returns_enotdir");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        fs.mkdir("dir").unwrap();
+        fs.create_file("file").unwrap();
+        fs.symlink("dir", "link").unwrap();
+
+        let inodes_before = fs.superblock.free_inodes;
+        let blocks_before = fs.superblock.free_blocks;
+
+        assert_eq!(fs.rmdir("file"), Err(FsError::ENOTDIR));
+        assert_eq!(fs.rmdir("link"), Err(FsError::ENOTDIR));
+
+        assert_eq!(fs.superblock.free_inodes, inodes_before);
+        assert_eq!(fs.superblock.free_blocks, blocks_before);
+        assert_eq!(fs.ls(".").unwrap().len(), 5);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn rmdir_missing_path_returns_enoent(){
+        let image = temp_image("rmdir_missing_path_returns_enoent");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        fs.mkdir("dir").unwrap();
+
+        assert_eq!(fs.rmdir("nope"), Err(FsError::ENOENT));
+        assert_eq!(fs.rmdir("dir/nope"), Err(FsError::ENOENT));
+        assert_eq!(fs.rmdir("nope/a/b"), Err(FsError::ENOENT));
+
+        assert_eq!(fs.ls(".").unwrap().len(), 3);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn rmdir_invalid_targets_return_einval_and_change_nothing(){
+        let image = temp_image("rmdir_invalid_targets_return_einval_and_change_nothing");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        fs.mkdir("dir").unwrap();
+        fs.mkdir("dir/a").unwrap();
+        fs.rmdir("dir/a").unwrap();
+
+        let inodes_before = fs.superblock.free_inodes;
+        let blocks_before = fs.superblock.free_blocks;
+        let nlink_before = fs.stat_file("/").unwrap().nlink;
+
+        assert_eq!(fs.rmdir(""), Err(FsError::EINVAL));
+        assert_eq!(fs.rmdir("/"), Err(FsError::EINVAL));
+        assert_eq!(fs.rmdir("."), Err(FsError::EINVAL));
+        assert_eq!(fs.rmdir(".."), Err(FsError::EINVAL));
+        assert_eq!(fs.rmdir("dir/."), Err(FsError::EINVAL));
+        assert_eq!(fs.rmdir("dir/.."), Err(FsError::EINVAL));
+
+        assert_eq!(fs.superblock.free_inodes, inodes_before);
+        assert_eq!(fs.superblock.free_blocks, blocks_before);
+        assert_eq!(fs.stat_file("/").unwrap().nlink, nlink_before);
+        assert_eq!(fs.ls("/").unwrap().len(), 3);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+        #[test]
+    fn cd_relative_path_changes_where_files_are_created(){
+        let image = temp_image("cd_relative_path_changes_where_files_are_created");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        let a = fs.mkdir("a").unwrap();
+        fs.cd("a").unwrap();
+        assert_eq!(fs.cwd, a);
+
+        let b = fs.create_file("b").unwrap();
+
+        assert_eq!(fs.ls("/a").unwrap().last().unwrap(), &(b, "b".to_string()));
+        assert_eq!(fs.ls("/").unwrap().len(), 3);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn cd_dotdot_and_root_work(){
+        let image = temp_image("cd_dotdot_and_root_work");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        let a = fs.mkdir("a").unwrap();
+        fs.mkdir("a/b").unwrap();
+
+        fs.cd("/a/b").unwrap();
+        fs.cd("..").unwrap();
+        assert_eq!(fs.cwd, a);
+
+        fs.cd("..").unwrap();
+        assert_eq!(fs.cwd, ROOT_INODE);
+
+        fs.cd("a/b").unwrap();
+        fs.cd("/").unwrap();
+        assert_eq!(fs.cwd, ROOT_INODE);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn cd_through_symlink_to_dir(){
+        let image = temp_image("cd_through_symlink_to_dir");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        let dir = fs.mkdir("dir").unwrap();
+        fs.symlink("/dir", "link").unwrap();
+
+        fs.cd("link").unwrap();
+        assert_eq!(fs.cwd, dir);
+
+        let f = fs.create_file("f").unwrap();
+        assert_eq!(fs.ls("/dir").unwrap().last().unwrap(), &(f, "f".to_string()));
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn cd_invalid_path_returns_err_and_keeps_cwd(){
+        let image = temp_image("cd_invalid_path_returns_err_and_keeps_cwd");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        let a = fs.mkdir("a").unwrap();
+        fs.create_file("a/file").unwrap();
+        fs.cd("a").unwrap();
+
+        assert_eq!(fs.cd("file"), Err(FsError::ENOTDIR));
+        assert_eq!(fs.cwd, a);
+        assert_eq!(fs.cd("nope"), Err(FsError::ENOENT));
+        assert_eq!(fs.cwd, a);
+        assert_eq!(fs.cd("/a/nope/b"), Err(FsError::ENOENT));
+        assert_eq!(fs.cwd, a);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn absolute_paths_work_after_cd(){
+        let image = temp_image("absolute_paths_work_after_cd");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        fs.mkdir("a").unwrap();
+        let b = fs.mkdir("a/b").unwrap();
+        fs.cd("a/b").unwrap();
+
+        let x = fs.create_file("/x").unwrap();
+
+        assert_eq!(fs.stat_file("/a/b").unwrap().id, b);
+        assert_eq!(fs.stat_file("/x").unwrap().id, x);
+        assert_eq!(fs.ls("/").unwrap().last().unwrap(), &(x, "x".to_string()));
+        assert_eq!(fs.ls("").unwrap().len(), 2);
+        assert_eq!(fs.pool.in_use(), 0);
     }
 }
