@@ -96,7 +96,7 @@ pub fn free_inode<D: RawDevice>(superblock: &mut Superblock, bit: u32, pool:&Buf
 }
 
 pub fn free_block<D: RawDevice>(superblock: &mut Superblock, bit: u32, pool:&BufferPooll, device: &mut D) -> FsResult<()>{
-    if bit < superblock.data_table_start || bit > superblock.total_blocks { 
+    if bit < superblock.data_table_start || bit >= superblock.total_blocks { 
         return Err(FsError::EINVAL) 
     };
 

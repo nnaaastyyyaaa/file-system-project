@@ -35,8 +35,8 @@ pub fn inode(id: u32) -> Inode
         mtime: 123456789, 
         ctime: 987654321, 
         direct, 
-        single_indirect: 098, 
-        double_indirect: 257 
+        single_indirect: 0, 
+        double_indirect: 0 
     }
 }
 

@@ -1,7 +1,7 @@
 use std::cmp::{min, max};
-use crate::{error::{FsError, FsResult}, indirection::{free_blocks_from, resolve_block}, inode::{Inode, now_ms}, inode_table, mem::BufferPooll, raw_device::{BLOCK_SIZE, RawDevice}, superblock::Superblock};
+use crate::{error::{FsError, FsResult}, indirection::{MAX_BLOCKS, free_blocks_from, resolve_block}, inode::{Inode, now_ms}, inode_table, mem::BufferPooll, raw_device::{BLOCK_SIZE, RawDevice}, superblock::Superblock};
 
-const MAX_FILE_SIZE: u64 = 1036 * BLOCK_SIZE as u64;
+const MAX_FILE_SIZE: u64 = MAX_BLOCKS as u64 * BLOCK_SIZE as u64;
 
 fn count_shift_bytes_to_read(offset: u64, n:u64, bytes_left:&mut usize, available: usize) -> (usize, usize){
         let shift:usize ;
@@ -619,6 +619,54 @@ mod tests{
         let mut out = vec![0u8; 5 * BLOCK_SIZE];
         assert_eq!(read_file(&mut device, &pool, &mut superblock, &mut inode, 0, &mut out), Ok(5 * BLOCK_SIZE as u64));
         assert_eq!(out, &data[..5 * BLOCK_SIZE]);
+        assert_eq!(pool.in_use(), 0);
+    }
+
+    #[test]
+    fn write_read_across_single_double_boundary() {
+        let (mut device, pool, mut superblock) = full_image("fio_single_double", 4 * MIB);
+        let mut inode = Inode::empty(2);
+
+        let offset = 1036 * BLOCK_SIZE as u64 - 10;
+        let data = pattern(100);
+        assert_eq!(write_file(&mut device, &pool, &mut superblock, &mut inode, offset, &data).unwrap(), 100);
+        assert_ne!(inode.double_indirect, 0);
+        assert_eq!(inode.size, offset + 100);
+
+        let mut out = vec![0u8; 100];
+        assert_eq!(read_file(&mut device, &pool, &mut superblock, &mut inode, offset, &mut out).unwrap(), 100);
+        assert_eq!(out, data);
+        assert_eq!(pool.in_use(), 0);
+    }
+
+    #[test]
+    fn sparse_write_in_double_zone_allocates_only_needed_blocks() {
+        let (mut device, pool, mut superblock) = full_image("fio_sparse_double", 4 * MIB);
+        let mut inode = Inode::empty(2);
+        let start = superblock.free_blocks;
+
+        let offset = 2060 * BLOCK_SIZE as u64;
+        write_file(&mut device, &pool, &mut superblock, &mut inode, offset, &[0xAB; 10]).unwrap();
+        assert_eq!(superblock.free_blocks, start - 3);
+
+        let mut gap = vec![0xFFu8; 4096];
+        read_file(&mut device, &pool, &mut superblock, &mut inode, 1500 * BLOCK_SIZE as u64, &mut gap).unwrap();
+        assert!(gap.iter().all(|&b| b == 0));
+        assert_eq!(pool.in_use(), 0);
+    }
+
+    #[test]
+    fn truncate_from_double_zone_frees_everything() {
+        let (mut device, pool, mut superblock) = full_image("fio_trunc_double", 4 * MIB);
+        let mut inode = Inode::empty(2);
+        let start = superblock.free_blocks;
+
+        write_file(&mut device, &pool, &mut superblock, &mut inode, 2060 * BLOCK_SIZE as u64, &[1u8; 10]).unwrap();
+        truncate_file(&mut device, &pool, &mut superblock, &mut inode, 0).unwrap();
+
+        assert_eq!(inode.size, 0);
+        assert_eq!(inode.double_indirect, 0);
+        assert_eq!(superblock.free_blocks, start);
         assert_eq!(pool.in_use(), 0);
     }
 }

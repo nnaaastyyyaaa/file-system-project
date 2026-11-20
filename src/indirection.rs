@@ -1,4 +1,8 @@
-use crate::{alloc::{alloc_block, free_block}, codec::{get_u32, put_u32}, error::{FsError, FsResult}, inode::Inode, mem::BufferPooll, raw_device::{ RawDevice}, superblock::{Superblock}};
+use crate::{alloc::{alloc_block, free_block}, codec::{get_u32, put_u32}, error::{FsError, FsResult}, inode::Inode, mem::BufferPooll, raw_device::{BLOCK_SIZE, RawDevice}, superblock::Superblock};
+
+const POINTERS_PER_BLOCK: u32 = BLOCK_SIZE as u32 / 4;
+const SINGLE_INDIRECT_END: u32 = 12 + POINTERS_PER_BLOCK;
+pub const MAX_BLOCKS: u32 = 12 + 1024 + 1024 * 1024;
 
 pub fn resolve_block<D: RawDevice>(device: &mut D, pool: &BufferPooll, superblock: &mut Superblock, inode: &mut Inode, allocate: bool, block: u32) -> FsResult<u32>{
     match block {
@@ -18,7 +22,7 @@ pub fn resolve_block<D: RawDevice>(device: &mut D, pool: &BufferPooll, superbloc
           return  Ok(n);
         },
 
-        12..1036 => {
+        12..SINGLE_INDIRECT_END => {
             let slot = (block - 12) as usize;
 
             if inode.single_indirect == 0 {
@@ -44,8 +48,51 @@ pub fn resolve_block<D: RawDevice>(device: &mut D, pool: &BufferPooll, superbloc
             put_u32(&mut buff[..], slot * 4, data_block);
             device.write(inode.single_indirect, &buff)?;
             Ok(data_block)
-        }
+        },
 
+        SINGLE_INDIRECT_END..MAX_BLOCKS => {
+            let mut num_double = inode.double_indirect;
+            if num_double == 0 {
+                if !allocate {
+                    return Ok(0);
+                }
+                inode.double_indirect = alloc_block(superblock, pool, device)?;
+                num_double = inode.double_indirect;
+            }
+
+            let slot_in_double = (block - SINGLE_INDIRECT_END) / POINTERS_PER_BLOCK;
+            let shift_in_slot = (block - SINGLE_INDIRECT_END) % POINTERS_PER_BLOCK;
+
+            let mut double = pool.take()?;
+            device.read(num_double, &mut double)?;
+
+            let mut num_single = get_u32(&double[..], slot_in_double as usize * 4);
+
+            if num_single == 0 {
+                if !allocate {
+                    return Ok(0);
+                }
+                num_single = alloc_block(superblock, pool, device)?;
+                put_u32(&mut double[..], slot_in_double as usize * 4, num_single);
+                device.write(num_double, &double)?;
+            }
+
+            let mut buff = pool.take()?;
+            device.read(num_single, &mut buff)?;
+
+            let data = get_u32(&buff[..], shift_in_slot as usize * 4);
+            if data != 0 {
+                return Ok(data);
+            }
+            if !allocate {
+                return Ok(0);
+            }
+
+            let new_block = alloc_block(superblock, pool, device)?;
+            put_u32(&mut buff[..], shift_in_slot as usize * 4, new_block);
+            device.write(num_single, &buff)?;
+            Ok(new_block)
+        },
         _ => {
             if allocate {
                 Err(FsError::EFBIG)
@@ -57,7 +104,7 @@ pub fn resolve_block<D: RawDevice>(device: &mut D, pool: &BufferPooll, superbloc
 }
 
 pub fn free_blocks_from<D: RawDevice>(device: &mut D, pool: &BufferPooll, superblock: &mut Superblock, inode: &mut Inode,  from: u32) -> FsResult<()>{
-    if from >= 1036 {
+    if from >= MAX_BLOCKS {
         return Ok(())
     }
 
@@ -74,33 +121,86 @@ pub fn free_blocks_from<D: RawDevice>(device: &mut D, pool: &BufferPooll, superb
         }
     }
 
-    let slot = from.saturating_sub(12);
-    if inode.single_indirect == 0 {
-        return Ok(())
+    if from < SINGLE_INDIRECT_END && inode.single_indirect != 0 {
+        let ptr = inode.single_indirect;
+        let slot = from.saturating_sub(12);
+        
+        let mut buff = pool.take()?;
+        device.read(ptr, &mut buff)?;
+    
+        for n in slot..POINTERS_PER_BLOCK {
+            let data_block  = get_u32(&buff[..], (n * 4) as usize);
+    
+            if data_block == 0 {
+                continue;
+            }
+    
+            free_block(superblock, data_block, pool, device)?;
+            put_u32(&mut buff[..], (n * 4) as usize, 0);
+        }
+    
+        device.write(ptr, &buff)?;
+
+        if from <= 12 {
+            free_block(superblock, inode.single_indirect, pool, device)?;
+            inode.single_indirect = 0;
+        }
     }
 
-    let ptr = inode.single_indirect;
-    
+    let ptr = inode.double_indirect;
+
+    if ptr == 0 {
+        return Ok(());
+    }
+
+    let slot_in_double = (from.saturating_sub(SINGLE_INDIRECT_END)) / POINTERS_PER_BLOCK;
+    let shift_in_slot = (from.saturating_sub(SINGLE_INDIRECT_END)) % POINTERS_PER_BLOCK;
+
     let mut buff = pool.take()?;
     device.read(ptr, &mut buff)?;
 
-    for n in slot..1024 {
-        let data_block  = get_u32(&buff[..], (n * 4) as usize);
+    for n in slot_in_double..POINTERS_PER_BLOCK {
+        let num_single = get_u32(&buff[..], n as usize * 4);
 
-        if data_block == 0 {
+        if num_single == 0 {
             continue;
         }
 
-        free_block(superblock, data_block, pool, device)?;
-        put_u32(&mut buff[..], (n * 4) as usize, 0);
-    }
+        let mut single_buff = pool.take()?;
+        device.read(num_single, &mut single_buff)?;
 
-    if from <= 12{
-        inode.single_indirect = 0;
-        free_block(superblock, ptr, pool, device)?;
-    }
+        let start;
+        if n == slot_in_double {
+            start = shift_in_slot;
+        } else {
+            start = 0;
+        }
 
+        for k in start..POINTERS_PER_BLOCK{
+            let data_block = get_u32(&single_buff[..], k as usize * 4);
+
+            if data_block == 0 {
+                continue;
+            }
+
+            free_block(superblock, data_block, pool, device)?;
+            put_u32(&mut single_buff[..], k as usize * 4, 0);
+        }
+
+        if start == 0 {
+            free_block(superblock, num_single, pool, device)?;
+            put_u32(&mut buff[..], n as usize * 4, 0);
+        }else{
+            device.write(num_single, &single_buff)?;
+        }
+    }
     device.write(ptr, &buff)?;
+
+    if from <= SINGLE_INDIRECT_END {
+        free_block(superblock, inode.double_indirect, pool, device)?;
+        inode.double_indirect = 0;
+    }
+
     Ok(())
 }
 
@@ -197,7 +297,6 @@ use crate::{alloc::alloc_block, codec::get_u32, error::FsError, indirection::{fr
     fn indirection_first_allocate_creates_two_new_blocks() {
         let (mut file_device, pool, mut superblock) = full_image("indirection_first_allocate", 4*MIB);
         let mut inode = inode(2);
-        inode.single_indirect = 0;
 
         let n_blocks = superblock.free_blocks;
 
@@ -211,9 +310,11 @@ use crate::{alloc::alloc_block, codec::get_u32, error::FsError, indirection::{fr
         let (mut file_device, pool, mut superblock) = full_image("indirection_with_existing_single_indirect", 4*MIB);
         let mut inode = inode(2);
 
-        let n_blocks = superblock.free_blocks;
-
+        
         resolve_block(&mut file_device, &pool, &mut superblock, &mut inode, true, 12).unwrap();
+        let n_blocks = superblock.free_blocks;
+        resolve_block(&mut file_device, &pool, &mut superblock, &mut inode, true, 13).unwrap();
+
         assert_eq!(superblock.free_blocks, n_blocks - 1);
         assert_eq!(pool.in_use(), 0);
     }
@@ -271,7 +372,7 @@ use crate::{alloc::alloc_block, codec::get_u32, error::FsError, indirection::{fr
 
         let n = resolve_block(&mut file_device, &pool, &mut superblock, &mut inode, false, 1036).unwrap();
         assert_eq!(n, 0);
-        assert_eq!(resolve_block(&mut file_device, &pool, &mut superblock, &mut inode, true, 1036), Err(FsError::EFBIG));
+        assert_eq!(resolve_block(&mut file_device, &pool, &mut superblock, &mut inode, true, MAX_BLOCKS), Err(FsError::EFBIG));
 
         assert_eq!(pool.in_use(), 0);
     }
@@ -294,7 +395,6 @@ use crate::{alloc::alloc_block, codec::get_u32, error::FsError, indirection::{fr
     fn full_free_blocks_from_works(){
         let (mut file_device, pool, mut superblock) = full_image("full_free_blocks", 4*MIB);
         let mut inode = inode(2);
-        inode.single_indirect = 0;
 
         let n_blocks = superblock.free_blocks;
         for n in 0..12{
@@ -312,7 +412,6 @@ use crate::{alloc::alloc_block, codec::get_u32, error::FsError, indirection::{fr
     fn free_from_13_dont_touch_previous_blocks(){
         let (mut file_device, pool, mut superblock) = full_image("ree_from_13", 4*MIB);
         let mut inode = inode(2);
-        inode.single_indirect = 0;
 
         for n in 0..12{
             inode.direct[n] = 0;
@@ -332,9 +431,8 @@ use crate::{alloc::alloc_block, codec::get_u32, error::FsError, indirection::{fr
 
     #[test]
     fn free_from_12_drops_single_indirect(){
-        let (mut file_device, pool, mut superblock) = full_image("ree_from_12", 4*MIB);
+        let (mut file_device, pool, mut superblock) = full_image("free_from_12", 4*MIB);
         let mut inode = inode(2);
-        inode.single_indirect = 0;
 
         resolve_block(&mut file_device, &pool, &mut superblock, &mut inode, false, 12 as u32).unwrap();
         resolve_block(&mut file_device, &pool, &mut superblock, &mut inode, false, 13 as u32).unwrap();
@@ -348,7 +446,6 @@ use crate::{alloc::alloc_block, codec::get_u32, error::FsError, indirection::{fr
     fn free_from_5_drops_blocks_correctly(){
         let (mut file_device, pool, mut superblock) = full_image("ree_from_5", 4*MIB);
         let mut inode = inode(2);
-        inode.single_indirect = 0;
 
         for n in 0..12{
             inode.direct[n] = 0;
@@ -367,7 +464,6 @@ use crate::{alloc::alloc_block, codec::get_u32, error::FsError, indirection::{fr
     fn free_on_empty_or_invalid_number_inode(){
         let (mut file_device, pool, mut superblock) = full_image("ree_on_empty_or_invalid_number", 4*MIB);
         let mut inode = inode(2);
-        inode.single_indirect = 0;
 
         for n in 0..12{
             inode.direct[n] = 0;
@@ -384,7 +480,6 @@ use crate::{alloc::alloc_block, codec::get_u32, error::FsError, indirection::{fr
     fn free_twice_is_safe(){
         let (mut file_device, pool, mut superblock) = full_image("free_twice_is_safe", 4*MIB);
         let mut inode = inode(2);
-        inode.single_indirect = 0;
 
         for n in 0..12{
             inode.direct[n] = 0;
@@ -400,7 +495,6 @@ use crate::{alloc::alloc_block, codec::get_u32, error::FsError, indirection::{fr
     fn free_then_allocate_works(){
         let (mut file_device, pool, mut superblock) = full_image("free_then_allocate", 4*MIB);
         let mut inode = inode(2);
-        inode.single_indirect = 0;
 
         for n in 0..12{
             inode.direct[n] = 0;
@@ -418,7 +512,6 @@ use crate::{alloc::alloc_block, codec::get_u32, error::FsError, indirection::{fr
     fn superblock_on_disk_matches_after_operations(){
         let (mut file_device, pool, mut superblock) = full_image("superblock_on_disk", 4*MIB);
         let mut inode = inode(2);
-        inode.single_indirect = 0;
 
         for n in 0..12{
             inode.direct[n] = 0;
@@ -440,4 +533,123 @@ use crate::{alloc::alloc_block, codec::get_u32, error::FsError, indirection::{fr
         assert_eq!(pool.in_use(), 0);
     }
 
+    #[test]
+    fn double_allocation_costs() {
+        let (mut dev, pool, mut sb) = full_image("dbl_alloc_costs", 4 * MIB);
+        let mut inode = Inode::empty(2);
+        let start = sb.free_blocks;
+
+        resolve_block(&mut dev, &pool, &mut sb, &mut inode, true, 1036).unwrap();
+        assert_eq!(sb.free_blocks, start - 3);
+        assert_ne!(inode.double_indirect, 0);
+
+        resolve_block(&mut dev, &pool, &mut sb, &mut inode, true, 1037).unwrap();
+        assert_eq!(sb.free_blocks, start - 4);
+
+        resolve_block(&mut dev, &pool, &mut sb, &mut inode, true, 1036 + 1024).unwrap();
+        assert_eq!(sb.free_blocks, start - 6);
+
+        assert_eq!(pool.in_use(), 0);
+    }
+
+    #[test]
+    fn double_max_block_boundary() {
+        let (mut dev, pool, mut sb) = full_image("dbl_max", 4 * MIB);
+        let mut inode = Inode::empty(2);
+        let start = sb.free_blocks;
+
+        let last = resolve_block(&mut dev, &pool, &mut sb, &mut inode, true, MAX_BLOCKS - 1).unwrap();
+        assert_ne!(last, 0);
+        assert_eq!(sb.free_blocks, start - 3);
+
+        assert_eq!(
+            resolve_block(&mut dev, &pool, &mut sb, &mut inode, true, MAX_BLOCKS),
+            Err(FsError::EFBIG)
+        );
+        assert_eq!(resolve_block(&mut dev, &pool, &mut sb, &mut inode, false, MAX_BLOCKS).unwrap(), 0);
+        assert_eq!(sb.free_blocks, start - 3);
+        assert_eq!(pool.in_use(), 0);
+    }
+
+    #[test]
+    fn double_enospc_in_the_middle_is_recoverable() {
+        let (mut dev, pool, mut sb) = full_image("dbl_enospc", 4 * MIB);
+        let mut inode = Inode::empty(2);
+
+        let free = sb.free_blocks;
+        for _ in 0..free - 1 {
+            alloc_block(&mut sb, &pool, &mut dev).unwrap();
+        }
+
+        assert_eq!(
+            resolve_block(&mut dev, &pool, &mut sb, &mut inode, true, 1036),
+            Err(FsError::ENOSPC)
+        );
+        assert_eq!(pool.in_use(), 0);
+        assert_eq!(sb.free_blocks, 0);
+        assert_ne!(inode.double_indirect, 0);
+
+        free_blocks_from(&mut dev, &pool, &mut sb, &mut inode, 0).unwrap();
+        assert_eq!(inode.double_indirect, 0);
+        assert_eq!(sb.free_blocks, 1);
+        assert_eq!(pool.in_use(), 0);
+    }
+
+    #[test]
+    fn free_blocks_from_double_zone_table() {
+        let blocks = [0u32, 12, 1036, 1037, 2060, 2061];
+        let cases = [(0u32, 10u32), (12, 9), (13, 7), (1036, 7), (1037, 4), (2060, 3), (2061, 1)];
+
+        for (from, expected) in cases {
+            let (mut dev, pool, mut sb) = full_image(&format!("dbl_free_{from}"), 4 * MIB);
+            let mut inode = Inode::empty(2);
+            let start = sb.free_blocks;
+
+            for b in blocks {
+                resolve_block(&mut dev, &pool, &mut sb, &mut inode, true, b).unwrap();
+            }
+            assert_eq!(sb.free_blocks, start - 10);
+
+            free_blocks_from(&mut dev, &pool, &mut sb, &mut inode, from).unwrap();
+            assert_eq!(sb.free_blocks, start - 10 + expected);
+
+            for b in blocks {
+                let r = resolve_block(&mut dev, &pool, &mut sb, &mut inode, false, b).unwrap();
+                if b < from {
+                    assert_ne!(r, 0);
+                } else {
+                    assert_eq!(r, 0);
+                }
+            }
+
+            if from <= 1036 {
+                assert_eq!(inode.double_indirect, 0);
+            } else {
+                assert_ne!(inode.double_indirect, 0);
+            }
+
+            let free_now = sb.free_blocks;
+            free_blocks_from(&mut dev, &pool, &mut sb, &mut inode, from).unwrap();
+            assert_eq!(sb.free_blocks, free_now);
+            assert_eq!(pool.in_use(), 0);
+        }
+    }
+
+    #[test]
+    fn double_free_then_allocate_again() {
+        let (mut dev, pool, mut sb) = full_image("dbl_free_realloc", 4 * MIB);
+        let mut inode = Inode::empty(2);
+        let start = sb.free_blocks;
+
+        for b in [1036, 1037, 2060] {
+            resolve_block(&mut dev, &pool, &mut sb, &mut inode, true, b).unwrap();
+        }
+        free_blocks_from(&mut dev, &pool, &mut sb, &mut inode, 0).unwrap();
+        assert_eq!(sb.free_blocks, start);
+
+        resolve_block(&mut dev, &pool, &mut sb, &mut inode, true, 1036).unwrap();
+        assert_eq!(sb.free_blocks, start - 3);
+        assert_eq!(resolve_block(&mut dev, &pool, &mut sb, &mut inode, false, 1037).unwrap(), 0);
+        assert_eq!(pool.in_use(), 0);
+    }
 }
