@@ -1,6 +1,6 @@
 use std::{env::temp_dir, path::PathBuf, process::id};
 
-use crate::{ alloc::alloc_inode, directory::add_entry, inode::{DIRECT_POINTERS, Inode, Type}, inode_table, mem::BufferPooll, mkfs::mkfs, raw_device::{FileDevice, RawDevice}, superblock::{ROOT_INODE, Superblock}};
+use crate::{ alloc::alloc_inode, directory::add_entry, fs::Fs, inode::{DIRECT_POINTERS, Inode, Type}, inode_table, mem::BufferPooll, mkfs::mkfs, raw_device::{FileDevice, RawDevice}, superblock::{ROOT_INODE, Superblock}};
 pub const MIB: u64 = 1024 * 1024;
 
 pub fn temp_image(name: &str) -> PathBuf{

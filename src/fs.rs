@@ -1,6 +1,6 @@
 use std::{collections::HashMap};
 
-use crate::{alloc::{alloc_inode, free_inode}, directory::{add_entry, lookup, remove_entry}, error::{FsError, FsResult}, file_io::{read_file, truncate_file, write_file}, inode::{self, Inode, Type, now_ms}, inode_table, mem::BufferPooll, mkfs::mkfs, path::{resolve_full, resolve_parent}, raw_device::{BLOCK_SIZE, RawDevice}, superblock::{ROOT_INODE, Superblock}};
+use crate::{alloc::{alloc_inode, free_inode}, directory::{self, add_entry, lookup, remove_entry}, error::{FsError, FsResult}, file_io::{read_file, truncate_file, write_file}, inode::{self, Inode, Type, now_ms}, inode_table, mem::BufferPooll, mkfs::mkfs, path::{resolve_full, resolve_parent}, perm::{CurrentUser, R, ROOT_USER, W, X, check_access}, raw_device::{BLOCK_SIZE, RawDevice}, superblock::{ROOT_INODE, Superblock}};
 
 const MAX_OPEN_FILES: usize = 64; 
 
@@ -8,6 +8,7 @@ const MAX_OPEN_FILES: usize = 64;
 pub struct OpenedFile {
     pub inode_id: u32,
     pub offset: u64,
+    pub flags: u16,
 }
 pub struct Fs <D: RawDevice> {
     pub device: D,
@@ -16,12 +17,13 @@ pub struct Fs <D: RawDevice> {
     pub opened_files: Vec<Option<OpenedFile>>,
     pub opened_inodes: HashMap<u32, u32>,
     pub cwd: u32,
+    pub current_user: CurrentUser
 }
 
 impl <D: RawDevice> Fs<D> {
     pub fn format_fs(mut device: D, pool: BufferPooll, inode_count: Option<u32>) -> FsResult<Self> {
        let superblock = mkfs(&pool, &mut device, inode_count)?;
-        Ok(Self {device, superblock, pool, opened_files: Vec::new(), opened_inodes: HashMap::new(), cwd: ROOT_INODE })
+        Ok(Self {device, superblock, pool, opened_files: Vec::new(), opened_inodes: HashMap::new(), cwd: ROOT_INODE, current_user: ROOT_USER })
     }
 
     fn make_inode_free(&mut self, id: u32){
@@ -30,21 +32,34 @@ impl <D: RawDevice> Fs<D> {
         let _ = inode_table::write(&inode, &mut self.device, &self.superblock, &self.pool);
     }
 
-    pub fn create_file(&mut self, path: &str) -> FsResult<u32> {
+    pub fn set_user(&mut self, user: CurrentUser) {
+        self.current_user = user;
+    }
+
+    pub fn create_file(&mut self, path: &str, mode: u16) -> FsResult<u32> {
+        if mode & !0o777 != 0 { 
+            return Err(FsError::EINVAL); 
+        }
+
         if path.ends_with("/"){
             return Err(FsError::EINVAL)
         }
 
-        let (name, id) = resolve_parent(&mut self.device, &self.pool, &mut self.superblock, self.cwd, path)?;
+        let (name, id) = resolve_parent(&mut self.device, &self.pool, &mut self.superblock, self.cwd, &self.current_user, path)?;
 
         let mut parent_inode = inode_table::read(id, &mut self.device, &self.superblock, &self.pool)?;
+
+        check_access(&parent_inode, &self.current_user, W | X)?;
+
         let inode_id = alloc_inode(&mut self.superblock, &self.pool, &mut self.device)?;
         let now = now_ms();
 
         let mut inode = Inode::empty(inode_id);
         inode.nlink = 1;
         inode.inode_type = Type::File;
-        inode.mode = 0o644;
+        inode.mode = mode;
+        inode.uid = self.current_user.uid;
+        inode.gid = self.current_user.gid;
         inode.mtime = now;
         inode.ctime = now;
 
@@ -62,7 +77,7 @@ impl <D: RawDevice> Fs<D> {
     }
 
     pub fn stat_file(&mut self, path: &str) -> FsResult<Inode> {
-        let (name, parent_id) = resolve_parent(&mut self.device, &self.pool, &mut self.superblock, self.cwd, path)?;
+        let (name, parent_id) = resolve_parent(&mut self.device, &self.pool, &mut self.superblock, self.cwd, &self.current_user, path)?;
         let mut parent_inode = inode_table::read(parent_id, &mut self.device, &self.superblock, &self.pool)?;
         let id = match lookup(&mut self.device, &mut self.superblock, &mut parent_inode, &self.pool, &name) {
             Ok(id) => id,
@@ -75,16 +90,19 @@ impl <D: RawDevice> Fs<D> {
 
     pub fn ls(&mut self, path: &str) -> FsResult<Vec<(u32, String)>> {
         let mut parent_inode;
+
         if path.is_empty() {
             parent_inode = inode_table::read(self.cwd, &mut self.device, &self.superblock, &self.pool)?;
         } else {
-            let id = resolve_full(&mut self.device, &self.pool, &mut self.superblock, self.cwd, path)?;
+            let id = resolve_full(&mut self.device, &self.pool, &mut self.superblock, self.cwd, &self.current_user, path)?;
             parent_inode = inode_table::read(id, &mut self.device, &self.superblock, &self.pool)?;
         }
 
         if parent_inode.inode_type != Type::Dir {
             return Err(FsError::ENOTDIR);
         }
+
+        check_access(&parent_inode, &self.current_user, R)?;
 
         let entries = crate::directory::list(&mut self.device, &mut self.superblock, &mut parent_inode, &self.pool)?;
         Ok(entries)
@@ -95,14 +113,16 @@ impl <D: RawDevice> Fs<D> {
             return Err(FsError::EPERM);
         }
 
-        let (name2, parent2_id) = resolve_parent(&mut self.device, &self.pool, &mut self.superblock, self.cwd, path2)?;
+        let (name2, parent2_id) = resolve_parent(&mut self.device, &self.pool, &mut self.superblock, self.cwd, &self.current_user, path2)?;
 
         let mut parent2_inode = inode_table::read(parent2_id, &mut self.device, &self.superblock, &self.pool)?;
+        check_access(&parent2_inode, &self.current_user, W | X)?;
 
         let mut inode = match self.stat_file(path1){
             Ok(inode) => inode,
             Err(e) => return Err(e),
         };
+
         if inode.inode_type == Type::Dir {
             return Err(FsError::EPERM);
         }
@@ -145,8 +165,11 @@ impl <D: RawDevice> Fs<D> {
     }
 
     pub fn unlink(&mut self, path: &str) -> FsResult<()>{
-        let (name, parent_id) = resolve_parent(&mut self.device, &self.pool, &mut self.superblock, self.cwd, path)?;
+        let (name, parent_id) = resolve_parent(&mut self.device, &self.pool, &mut self.superblock, self.cwd, &self.current_user, path)?;
+
         let mut parent_inode = inode_table::read(parent_id, &mut self.device, &mut self.superblock, &self.pool)?;
+        check_access(&parent_inode, &self.current_user, W | X)?;
+
         let mut inode = self.stat_file(path)?;
         if inode.inode_type == Type::Dir {
             return Err(FsError::EISDIR);
@@ -163,12 +186,19 @@ impl <D: RawDevice> Fs<D> {
         Ok(())
     }
 
-    pub fn open(&mut self, path: &str) -> FsResult<usize>{
-        let inode_id = resolve_full(&mut self.device, &self.pool, &mut self.superblock, self.cwd, path)?;
+    pub fn open(&mut self, path: &str, flags: u16) -> FsResult<usize>{
+        if flags & (R | W) == 0 || flags & !(R | W) != 0 {
+            return Err(FsError::EINVAL);
+        }
+
+        let inode_id = resolve_full(&mut self.device, &self.pool, &mut self.superblock, self.cwd, &self.current_user, path)?;
         let inode = inode_table::read(inode_id, &mut self.device, &mut self.superblock, &self.pool)?;
+
         if inode.inode_type != Type::File && inode.inode_type != Type::Symlink{
             return Err(FsError::EISDIR)
         }
+        check_access(&inode, &self.current_user, flags)?;
+
         let fd = match self.opened_files.iter().position(|el| el.is_none()){
             Some(fd) => fd,
             None => {
@@ -181,7 +211,8 @@ impl <D: RawDevice> Fs<D> {
         };
         let opened_file = OpenedFile{
             inode_id: inode.id,
-            offset: 0
+            offset: 0, 
+            flags
         };
         self.opened_files[fd] = Some(opened_file);
         *self.opened_inodes.entry(inode.id).or_insert(0) += 1;
@@ -222,6 +253,10 @@ impl <D: RawDevice> Fs<D> {
         file.offset.checked_add(buff.len() as u64).ok_or(FsError::EFBIG)?;
 
         let mut inode = inode_table::read(file.inode_id, &mut self.device, &mut self.superblock, &self.pool)?;
+        if file.flags & W == 0 { 
+            return Err(FsError::EACCES); 
+        }
+
         let written = write_file(&mut self.device, &self.pool, &mut self.superblock, &mut inode, file.offset, buff)?;
         
         if let Some(Some(f)) = self.opened_files.get_mut(fd) {
@@ -238,6 +273,9 @@ impl <D: RawDevice> Fs<D> {
         file.offset.checked_add(buff.len() as u64).ok_or(FsError::EFBIG)?;
 
         let mut inode = inode_table::read(file.inode_id, &mut self.device, &mut self.superblock, &self.pool)?;
+        if file.flags & R == 0 { 
+            return Err(FsError::EACCES); 
+        }
 
         let read = read_file(&mut self.device, &self.pool, &mut self.superblock, &mut inode, file.offset, buff)?;
         
@@ -248,12 +286,14 @@ impl <D: RawDevice> Fs<D> {
     }
 
     pub fn truncate(&mut self, path: &str, size: u64) -> FsResult<()>{
-        let inode_id = resolve_full(&mut self.device, &self.pool, &mut self.superblock, self.cwd, path)?;
+        let inode_id = resolve_full(&mut self.device, &self.pool, &mut self.superblock, self.cwd, &self.current_user, path)?;
         let mut inode = inode_table::read(inode_id, &mut self.device, &mut self.superblock, &self.pool)?;
 
         if inode.inode_type != Type::File{
             return Err(FsError::EISDIR);
         }
+
+        check_access(&inode, &self.current_user, W)?;
 
         truncate_file(&mut self.device, &self.pool, &mut self.superblock, &mut inode, size)?;
 
@@ -273,8 +313,9 @@ impl <D: RawDevice> Fs<D> {
             return Err(FsError::EINVAL);
         }
 
-        let (name, parent_id) = resolve_parent(&mut self.device, &self.pool, &mut self.superblock, self.cwd, path)?;
+        let (name, parent_id) = resolve_parent(&mut self.device, &self.pool, &mut self.superblock, self.cwd, &self.current_user, path)?;
         let mut parent_inode = inode_table::read(parent_id, &mut self.device, &mut self.superblock, &self.pool)?;
+        check_access(&parent_inode, &self.current_user, W | X)?;
 
         let new_id = alloc_inode(&mut self.superblock, &self.pool, &mut self.device)?;
         let mut new_inode = Inode::empty(new_id);
@@ -316,14 +357,20 @@ impl <D: RawDevice> Fs<D> {
         Ok(new_id)
     }
 
-    pub fn mkdir(&mut self, path:&str) -> FsResult<u32>{
+    pub fn mkdir(&mut self, path:&str, mode: u16) -> FsResult<u32>{
+        if mode & !0o777 != 0 { 
+            return Err(FsError::EINVAL); 
+        }
+
         if path.is_empty() {
             return Err(FsError::EINVAL)
         }
 
-        let (name, parent_dir_id) = resolve_parent(&mut self.device, &self.pool, &mut self.superblock, self.cwd, path)?;
+        let (name, parent_dir_id) = resolve_parent(&mut self.device, &self.pool, &mut self.superblock, self.cwd, &self.current_user, path)?;
 
         let mut parent_inode = inode_table::read(parent_dir_id, &mut self.device, &mut self.superblock, &self.pool)?;
+        check_access(&parent_inode, &self.current_user, W | X)?;
+
         match lookup(&mut self.device, &mut self.superblock, &mut parent_inode, &self.pool, &name) {
             Ok(_) => {
                 return Err(FsError::EEXIST);
@@ -336,7 +383,9 @@ impl <D: RawDevice> Fs<D> {
         let mut dir_inode = Inode::empty(inode_id);
         let now = now_ms();
         dir_inode.inode_type = Type::Dir;
-        dir_inode.mode = 0o777;
+        dir_inode.mode = mode;
+        dir_inode.uid = self.current_user.uid;
+        dir_inode.gid = self.current_user.gid;
         dir_inode.ctime = now;
         dir_inode.mtime = now;
         dir_inode.nlink = 2;
@@ -383,8 +432,10 @@ impl <D: RawDevice> Fs<D> {
             return Err(FsError::EINVAL);
         }
 
-        let (name, parent_id) = resolve_parent(&mut self.device, &self.pool, &mut self.superblock, self.cwd, path)?;
+        let (name, parent_id) = resolve_parent(&mut self.device, &self.pool, &mut self.superblock, self.cwd, &self.current_user, path)?;
         let mut parent_inode = inode_table::read(parent_id, &mut self.device, &mut self.superblock, &self.pool)?;
+        check_access(&parent_inode, &self.current_user, W | X)?;
+
         let id = lookup(&mut self.device, &mut self.superblock, &mut parent_inode, &self.pool, &name)?;
 
         let mut inode = inode_table::read(id, &mut self.device, &mut self.superblock, &self.pool)?;
@@ -392,7 +443,7 @@ impl <D: RawDevice> Fs<D> {
             return Err(FsError::ENOTDIR);
         }
 
-        let list: Vec<(u32, String)> = self.ls(path)?.into_iter().filter(|(_, name)| name != "." && name != "..").collect();
+        let list: Vec<(u32, String)> = directory::list(&mut self.device, &mut self.superblock, &mut inode, &self.pool)?.into_iter().filter(|(_, name)| name != "." && name != "..").collect();
         if list.len() > 0 {
             return Err(FsError::ENOTEMPTY);
         }
@@ -411,11 +462,14 @@ impl <D: RawDevice> Fs<D> {
     }
 
     pub fn cd(&mut self, path: &str) -> FsResult<()>{
-        let id = resolve_full(&mut self.device, &self.pool, &mut self.superblock, self.cwd, path)?;
+        let id = resolve_full(&mut self.device, &self.pool, &mut self.superblock, self.cwd, &self.current_user, path)?;
         let inode = inode_table::read(id, &mut self.device, &mut self.superblock, &self.pool)?;
+        
         if inode.inode_type != Type::Dir {
             return Err(FsError::ENOTDIR);
         }
+
+        check_access(&inode, &self.current_user, X)?;
         self.cwd = id;
         Ok(())
     }
@@ -508,8 +562,8 @@ mod tests{
         let image = temp_image("create_adds_name_to_root");
         let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
         let pool = BufferPooll::new();
-        let mut fs =Fs::format_fs(device, pool, Some(128)).unwrap();
-        let file_id = fs.create_file("my_file").unwrap();
+        let mut fs = Fs::format_fs(device, pool, Some(128)).unwrap();
+        let file_id = fs.create_file("my_file", 0o644).unwrap();
 
         let mut root = inode_table::read(ROOT_INODE, &mut fs.device, &fs.superblock, &fs.pool).unwrap();
         let entries = list(&mut fs.device, &mut fs.superblock, &mut root, &fs.pool).unwrap();
@@ -523,7 +577,7 @@ mod tests{
         let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
         let pool = BufferPooll::new();
         let mut fs =Fs::format_fs(device, pool, Some(128)).unwrap();
-        let file_id = fs.create_file("my_file").unwrap();
+        let file_id = fs.create_file("my_file", 0o644).unwrap();
 
         let inode =  inode_table::read(file_id, &mut fs.device, &fs.superblock, &fs.pool).unwrap();
         assert_eq!(inode.inode_type, Type::File);
@@ -542,7 +596,7 @@ mod tests{
         let free_blocks_before = fs.superblock.free_blocks;
         let free_inodes_before = fs.superblock.free_inodes;
 
-        fs.create_file("my_file").unwrap();
+        fs.create_file("my_file", 0o644).unwrap();
 
         assert_eq!(fs.superblock.free_blocks, free_blocks_before);
         assert_eq!(fs.superblock.free_inodes, free_inodes_before - 1);
@@ -559,10 +613,10 @@ mod tests{
         let free_blocks_before = fs.superblock.free_blocks;
         let free_inodes_before = fs.superblock.free_inodes;
 
-        let first_id = fs.create_file("my_file").unwrap();
-        assert_eq!(fs.create_file("my_file"), Err(FsError::EEXIST));
+        let first_id = fs.create_file("my_file", 0o644).unwrap();
+        assert_eq!(fs.create_file("my_file", 0o644), Err(FsError::EEXIST));
 
-        let second_id = fs.create_file("my_file2").unwrap();
+        let second_id = fs.create_file("my_file2", 0o644).unwrap();
         assert_eq!(first_id, second_id - 1);
         assert_eq!(fs.superblock.free_blocks, free_blocks_before);
         assert_eq!(fs.superblock.free_inodes, free_inodes_before - 2);
@@ -576,9 +630,9 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs =Fs::format_fs(device, pool, Some(128)).unwrap();
 
-        assert_eq!(fs.create_file(""), Err(FsError::EINVAL));
-        assert_eq!(fs.create_file(&"a".repeat(65)), Err(FsError::ENAMETOOLONG));
-        assert_eq!(fs.create_file("a/"), Err(FsError::EINVAL));
+        assert_eq!(fs.create_file("", 0o644), Err(FsError::EINVAL));
+        assert_eq!(fs.create_file(&"a".repeat(65), 0o644), Err(FsError::ENAMETOOLONG));
+        assert_eq!(fs.create_file("a/", 0o644), Err(FsError::EINVAL));
     }
 
     #[test]
@@ -588,8 +642,8 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs =Fs::format_fs(device, pool, Some(128)).unwrap();
 
-        assert_eq!(fs.create_file("."), Err(FsError::EEXIST));
-        assert_eq!(fs.create_file(".."), Err(FsError::EEXIST));
+        assert_eq!(fs.create_file(".", 0o644), Err(FsError::EEXIST));
+        assert_eq!(fs.create_file("..", 0o644), Err(FsError::EEXIST));
     }
 
     #[test]
@@ -601,9 +655,9 @@ mod tests{
 
         for i in 0..31 {
             let name = format!("file{}", i);
-            fs.create_file(&name).unwrap();
+            fs.create_file(&name, 0o644).unwrap();
         }
-        assert_eq!(fs.create_file("file32"), Err(FsError::ENOSPC));
+        assert_eq!(fs.create_file("file32", 0o644), Err(FsError::ENOSPC));
         assert_eq!(fs.pool.in_use(), 0);
     }
 
@@ -616,7 +670,7 @@ mod tests{
 
         for i in 0..72 {
             let name = format!("file{}", i);
-            fs.create_file(&name).unwrap();
+            fs.create_file(&name, 0o644).unwrap();
         }
 
         let mut root = inode_table::read(ROOT_INODE, &mut fs.device, &fs.superblock, &fs.pool).unwrap();
@@ -640,7 +694,7 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs =Fs::format_fs(device, pool, Some(128)).unwrap();
     
-        fs.create_file("data").unwrap();
+        fs.create_file("data", 0o644).unwrap();
         let inode = fs.stat_file("data").unwrap();
         assert_eq!(inode.id, 2);
         assert_eq!(inode.inode_type, Type::File);
@@ -709,8 +763,8 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, Some(128)).unwrap();
 
-        let a = fs.create_file("a").unwrap();
-        let b = fs.create_file("b").unwrap();
+        let a = fs.create_file("a", 0o644).unwrap();
+        let b = fs.create_file("b", 0o644).unwrap();
         let entries = fs.ls("").unwrap();
 
         assert_eq!(entries.len(), 4);
@@ -726,7 +780,7 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let file_id = fs.create_file("data").unwrap();
+        let file_id = fs.create_file("data", 0o644).unwrap();
         fs.link("data", "new_data").unwrap();
 
         let mut root_inode = inode_table::read(ROOT_INODE, &mut fs.device, &mut fs.superblock, &fs.pool).unwrap();
@@ -756,8 +810,8 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.create_file("data").unwrap();
-        fs.create_file("new_data").unwrap();
+        fs.create_file("data", 0o644).unwrap();
+        fs.create_file("new_data", 0o644).unwrap();
         assert_eq!(fs.link("data", "new_data"), Err(FsError::EEXIST));
 
         let inode = fs.stat_file("data").unwrap();
@@ -787,7 +841,7 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.create_file("data").unwrap();
+        fs.create_file("data", 0o644).unwrap();
         assert_eq!(fs.link("data", "new/data"), Err(FsError::ENOENT));
         assert_eq!(fs.link("data", ""), Err(FsError::EINVAL));
 
@@ -803,7 +857,7 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.create_file("data").unwrap();
+        fs.create_file("data", 0o644).unwrap();
         fs.link("data", "a").unwrap();
         fs.link("data", "b").unwrap();
 
@@ -821,7 +875,7 @@ mod tests{
 
         let entries_per_block = BLOCK_SIZE / ENTRY_SIZE;
         for n in 2..entries_per_block {
-            fs.create_file(&format!("data{}",n)).unwrap();
+            fs.create_file(&format!("data{}",n), 0o644).unwrap();
         }
         fs.link("data3", "a").unwrap();
 
@@ -839,7 +893,7 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let id = fs.create_file("data").unwrap();
+        let id = fs.create_file("data", 0o644).unwrap();
         fs.link("data", "one_more_name").unwrap();
 
         let inodes_before = fs.superblock.free_inodes;
@@ -872,7 +926,7 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let id = fs.create_file("data").unwrap();
+        let id = fs.create_file("data", 0o644).unwrap();
 
         let inodes_before = fs.superblock.free_inodes;
         let blocks_before = fs.superblock.free_blocks;
@@ -887,7 +941,7 @@ mod tests{
 
         assert_eq!(fs.superblock.free_blocks, blocks_before);
         assert_eq!(fs.superblock.free_inodes - 1, inodes_before);
-        assert_eq!(fs.create_file("other").unwrap(), id);
+        assert_eq!(fs.create_file("other", 0o644).unwrap(), id);
         assert_eq!(fs.pool.in_use(), 0);
     }
 
@@ -900,7 +954,7 @@ mod tests{
         let inodes_before = fs.superblock.free_inodes;
         let blocks_before = fs.superblock.free_blocks;
 
-        let id =fs.create_file("data").unwrap();
+        let id =fs.create_file("data", 0o644).unwrap();
         fs.link("data", "name2").unwrap();
         assert_eq!(fs.stat_file("name2").unwrap().id, id);
 
@@ -948,11 +1002,11 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.create_file("data").unwrap();
-        assert_eq!(fs.open("data").unwrap(), 0);
+        fs.create_file("data", 0o644).unwrap();
+        assert_eq!(fs.open("data", R).unwrap(), 0);
 
-        fs.create_file("new_data").unwrap();
-        assert_eq!(fs.open("new_data").unwrap(), 1);
+        fs.create_file("new_data", 0o644).unwrap();
+        assert_eq!(fs.open("new_data", R).unwrap(), 1);
         assert_eq!(fs.pool.in_use(), 0);
     }
 
@@ -963,10 +1017,10 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let id = fs.create_file("data").unwrap();
-        let fd = fs.open("data").unwrap();
+        let id = fs.create_file("data", 0o644).unwrap();
+        let fd = fs.open("data", R).unwrap();
 
-        assert_eq!(fs.opened_files[fd], Some(OpenedFile { inode_id: id, offset: 0}));
+        assert_eq!(fs.opened_files[fd], Some(OpenedFile { inode_id: id, offset: 0, flags: R}));
         assert_eq!(fs.pool.in_use(), 0);
     }
     
@@ -977,7 +1031,7 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        assert_eq!(fs.open("data"), Err(FsError::ENOENT));
+        assert_eq!(fs.open("data", R), Err(FsError::ENOENT));
         assert_eq!(fs.pool.in_use(), 0);
     }
 
@@ -988,8 +1042,8 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        assert_eq!(fs.open("."), Err(FsError::EISDIR));
-        assert_eq!(fs.open(".."), Err(FsError::EISDIR));
+        assert_eq!(fs.open(".", R), Err(FsError::EISDIR));
+        assert_eq!(fs.open("..", R), Err(FsError::EISDIR));
         assert_eq!(fs.pool.in_use(), 0);
     }
 
@@ -1001,12 +1055,12 @@ mod tests{
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
         for n in 0..MAX_OPEN_FILES{
-            fs.create_file(&format!("data{}",n)).unwrap();
-            fs.open(&format!("data{}",n)).unwrap();
+            fs.create_file(&format!("data{}",n), 0o644).unwrap();
+            fs.open(&format!("data{}",n), R).unwrap();
         }
-        fs.create_file("data64").unwrap();
+        fs.create_file("data64", 0o644).unwrap();
 
-        assert_eq!(fs.open("data64"), Err(FsError::ENOMEM));
+        assert_eq!(fs.open("data64", R), Err(FsError::ENOMEM));
         assert_eq!(fs.pool.in_use(), 0);
     }
 
@@ -1017,20 +1071,20 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let id_a = fs.create_file("a").unwrap();
-        let id_b = fs.create_file("b").unwrap();
+        let id_a = fs.create_file("a", 0o644).unwrap();
+        let id_b = fs.create_file("b", 0o644).unwrap();
 
-        let fd_a = fs.open("a").unwrap();
-        let fd_b = fs.open("b").unwrap();
-        let fd_a2 = fs.open("a").unwrap();
+        let fd_a = fs.open("a", R).unwrap();
+        let fd_b = fs.open("b", R).unwrap();
+        let fd_a2 = fs.open("a", R).unwrap();
 
         assert_eq!(fd_a, 0);
         assert_eq!(fd_b, 1);
         assert_eq!(fd_a2, 2);
 
-        assert_eq!(fs.opened_files[fd_a], Some(OpenedFile { inode_id: id_a, offset: 0 }));
-        assert_eq!(fs.opened_files[fd_b], Some(OpenedFile { inode_id: id_b, offset: 0 }));
-        assert_eq!(fs.opened_files[fd_a2], Some(OpenedFile { inode_id: id_a, offset: 0 }));
+        assert_eq!(fs.opened_files[fd_a], Some(OpenedFile { inode_id: id_a, offset: 0, flags: R }));
+        assert_eq!(fs.opened_files[fd_b], Some(OpenedFile { inode_id: id_b, offset: 0, flags: R }));
+        assert_eq!(fs.opened_files[fd_a2], Some(OpenedFile { inode_id: id_a, offset: 0, flags: R }));
 
         assert_eq!(fs.opened_inodes.get(&id_a), Some(&2));
         assert_eq!(fs.opened_inodes.get(&id_b), Some(&1));
@@ -1045,8 +1099,8 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let id = fs.create_file("a").unwrap();
-        let fd = fs.open("a").unwrap();
+        let id = fs.create_file("a", 0o644).unwrap();
+        let fd = fs.open("a", R).unwrap();
 
         fs.close(fd).unwrap();
         assert_eq!(fs.opened_files[fd], None);
@@ -1061,14 +1115,14 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let id = fs.create_file("a").unwrap();
-        let fd1 = fs.open("a").unwrap();
-        let fd2 = fs.open("a").unwrap();
+        let id = fs.create_file("a", 0o644).unwrap();
+        let fd1 = fs.open("a", R).unwrap();
+        let fd2 = fs.open("a", R).unwrap();
         assert_eq!(fs.opened_inodes.get(&id), Some(&2));
 
         fs.close(fd1).unwrap();
         assert_eq!(fs.opened_files[fd1], None);
-        assert_eq!(fs.opened_files[fd2], Some(OpenedFile { inode_id: id, offset: 0 }));
+        assert_eq!(fs.opened_files[fd2], Some(OpenedFile { inode_id: id, offset: 0, flags: R }));
         assert_eq!(fs.opened_inodes.get(&id), Some(&1));
 
         fs.close(fd2).unwrap();
@@ -1085,8 +1139,8 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let id = fs.create_file("a").unwrap();
-        fs.open("a").unwrap();
+        let id = fs.create_file("a", 0o644).unwrap();
+        fs.open("a", R).unwrap();
         fs.close(0).unwrap();
 
         let files_before = fs.opened_files.clone();
@@ -1110,8 +1164,8 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.create_file("a").unwrap();
-        let fd = fs.open("a").unwrap();
+        fs.create_file("a", 0o644).unwrap();
+        let fd = fs.open("a", R).unwrap();
 
         assert_eq!(fs.close(fd), Ok(()));
         assert_eq!(fs.close(fd), Err(FsError::EINVAL));
@@ -1128,23 +1182,23 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let id_a = fs.create_file("a").unwrap();
-        let id_b = fs.create_file("b").unwrap();
-        let id_c = fs.create_file("c").unwrap();
+        let id_a = fs.create_file("a", 0o644).unwrap();
+        let id_b = fs.create_file("b", 0o644).unwrap();
+        let id_c = fs.create_file("c", 0o644).unwrap();
 
-        assert_eq!(fs.open("a").unwrap(), 0);
-        assert_eq!(fs.open("b").unwrap(), 1);
-        assert_eq!(fs.open("c").unwrap(), 2);
+        assert_eq!(fs.open("a", R).unwrap(), 0);
+        assert_eq!(fs.open("b", R).unwrap(), 1);
+        assert_eq!(fs.open("c", R).unwrap(), 2);
 
         fs.close(1).unwrap();
         assert_eq!(fs.opened_files.len(), 3);
-        assert_eq!(fs.opened_files[0], Some(OpenedFile { inode_id: id_a, offset: 0 }));
+        assert_eq!(fs.opened_files[0], Some(OpenedFile { inode_id: id_a, offset: 0, flags: R }));
         assert_eq!(fs.opened_files[1], None);
-        assert_eq!(fs.opened_files[2], Some(OpenedFile { inode_id: id_c, offset: 0 }));
+        assert_eq!(fs.opened_files[2], Some(OpenedFile { inode_id: id_c, offset: 0, flags: R }));
         assert_eq!(fs.opened_inodes.get(&id_b), None);
 
-        assert_eq!(fs.open("c").unwrap(), 1);
-        assert_eq!(fs.opened_files[1], Some(OpenedFile { inode_id: id_c, offset: 0 }));
+        assert_eq!(fs.open("c", R).unwrap(), 1);
+        assert_eq!(fs.opened_files[1], Some(OpenedFile { inode_id: id_c, offset: 0, flags: R }));
         assert_eq!(fs.opened_inodes.get(&id_c), Some(&2));
         assert_eq!(fs.opened_files.len(), 3);
         assert_eq!(fs.pool.in_use(), 0);
@@ -1157,11 +1211,11 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let id = fs.create_file("a").unwrap();
+        let id = fs.create_file("a", 0o644).unwrap();
         let inodes_before = fs.superblock.free_inodes;
         let blocks_before = fs.superblock.free_blocks;
 
-        let fd = fs.open("a").unwrap();
+        let fd = fs.open("a", R).unwrap();
         fs.unlink("a").unwrap();
 
         assert_eq!(fs.stat_file("a"), Err(FsError::ENOENT));
@@ -1189,12 +1243,12 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let id = fs.create_file("a").unwrap();
+        let id = fs.create_file("a", 0o644).unwrap();
         fs.link("a", "b").unwrap();
         let inodes_before = fs.superblock.free_inodes;
         let blocks_before = fs.superblock.free_blocks;
 
-        let fd = fs.open("a").unwrap();
+        let fd = fs.open("a", R).unwrap();
 
         fs.unlink("a").unwrap();
         assert_eq!(fs.stat_file("b").unwrap().nlink, 1);
@@ -1222,15 +1276,15 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let id_a = fs.create_file("a").unwrap();
-        let id_b = fs.create_file("b").unwrap();
-        let fd_a = fs.open("a").unwrap();
-        let fd_b = fs.open("b").unwrap();
+        let id_a = fs.create_file("a", 0o644).unwrap();
+        let id_b = fs.create_file("b", 0o644).unwrap();
+        let fd_a = fs.open("a", R).unwrap();
+        let fd_b = fs.open("b", R).unwrap();
 
         fs.seek(fd_a, 100).unwrap();
 
-        assert_eq!(fs.opened_files[fd_a], Some(OpenedFile { inode_id: id_a, offset: 100 }));
-        assert_eq!(fs.opened_files[fd_b], Some(OpenedFile { inode_id: id_b, offset: 0 }));
+        assert_eq!(fs.opened_files[fd_a], Some(OpenedFile { inode_id: id_a, offset: 100, flags: R }));
+        assert_eq!(fs.opened_files[fd_b], Some(OpenedFile { inode_id: id_b, offset: 0, flags: R }));
         assert_eq!(fs.pool.in_use(), 0);
     }
 
@@ -1243,10 +1297,10 @@ mod tests{
 
         assert_eq!(fs.seek(0, 10), Err(FsError::EINVAL));
 
-        fs.create_file("a").unwrap();
-        fs.create_file("b").unwrap();
-        fs.open("a").unwrap();
-        fs.open("b").unwrap();
+        fs.create_file("a", 0o644).unwrap();
+        fs.create_file("b", 0o644).unwrap();
+        fs.open("a", R).unwrap();
+        fs.open("b", R).unwrap();
         fs.close(0).unwrap();
 
         let files_before = fs.opened_files.clone();
@@ -1267,15 +1321,15 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let id = fs.create_file("a").unwrap();
-        let fd1 = fs.open("a").unwrap();
-        let fd2 = fs.open("a").unwrap();
+        let id = fs.create_file("a", 0o644).unwrap();
+        let fd1 = fs.open("a", R).unwrap();
+        let fd2 = fs.open("a", R).unwrap();
 
         fs.seek(fd1, 5).unwrap();
         fs.seek(fd2, 50).unwrap();
 
-        assert_eq!(fs.opened_files[fd1], Some(OpenedFile { inode_id: id, offset: 5 }));
-        assert_eq!(fs.opened_files[fd2], Some(OpenedFile { inode_id: id, offset: 50 }));
+        assert_eq!(fs.opened_files[fd1], Some(OpenedFile { inode_id: id, offset: 5, flags: R }));
+        assert_eq!(fs.opened_files[fd2], Some(OpenedFile { inode_id: id, offset: 50, flags: R }));
         assert_eq!(fs.opened_inodes.get(&id), Some(&2));
         assert_eq!(fs.pool.in_use(), 0);
     }
@@ -1287,15 +1341,15 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let id = fs.create_file("a").unwrap();
-        let fd = fs.open("a").unwrap();
+        let id = fs.create_file("a", 0o644).unwrap();
+        let fd = fs.open("a", R).unwrap();
 
         fs.seek(fd, 1000).unwrap();
         fs.seek(fd, 7).unwrap();
-        assert_eq!(fs.opened_files[fd], Some(OpenedFile { inode_id: id, offset: 7 }));
+        assert_eq!(fs.opened_files[fd], Some(OpenedFile { inode_id: id, offset: 7, flags: R }));
 
         fs.seek(fd, 0).unwrap();
-        assert_eq!(fs.opened_files[fd], Some(OpenedFile { inode_id: id, offset: 0 }));
+        assert_eq!(fs.opened_files[fd], Some(OpenedFile { inode_id: id, offset: 0, flags: R }));
         assert_eq!(fs.pool.in_use(), 0);
     }
 
@@ -1306,8 +1360,8 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let id = fs.create_file("a").unwrap();
-        let fd = fs.open("a").unwrap();
+        let id = fs.create_file("a", 0o644).unwrap();
+        let fd = fs.open("a", R).unwrap();
 
         let inode_before = inode_table::read(id, &mut fs.device, &fs.superblock, &fs.pool).unwrap();
         let inodes_before = fs.superblock.free_inodes;
@@ -1331,14 +1385,14 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let id = fs.create_file("a").unwrap();
-        let fd = fs.open("a").unwrap();
+        let id = fs.create_file("a", 0o644).unwrap();
+        let fd = fs.open("a", R).unwrap();
         fs.seek(fd, 500).unwrap();
         fs.close(fd).unwrap();
 
-        let fd2 = fs.open("a").unwrap();
+        let fd2 = fs.open("a", R).unwrap();
         assert_eq!(fd2, fd);
-        assert_eq!(fs.opened_files[fd2], Some(OpenedFile { inode_id: id, offset: 0 }));
+        assert_eq!(fs.opened_files[fd2], Some(OpenedFile { inode_id: id, offset: 0, flags: R}));
         assert_eq!(fs.pool.in_use(), 0);
     }
 
@@ -1349,12 +1403,12 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let id = fs.create_file("a").unwrap();
-        let fd = fs.open("a").unwrap();
+        let id = fs.create_file("a", 0o644).unwrap();
+        let fd = fs.open("a", R).unwrap();
         fs.unlink("a").unwrap();
 
         assert_eq!(fs.seek(fd, 42), Ok(()));
-        assert_eq!(fs.opened_files[fd], Some(OpenedFile { inode_id: id, offset: 42 }));
+        assert_eq!(fs.opened_files[fd], Some(OpenedFile { inode_id: id, offset: 42, flags: R}));
 
         fs.close(fd).unwrap();
         assert_eq!(fs.seek(fd, 1), Err(FsError::EINVAL));
@@ -1368,15 +1422,16 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let id = fs.create_file("a").unwrap();
-        let fd = fs.open("a").unwrap();
+        let id = fs.create_file("a", 0o644).unwrap();
+        let fd = fs.open("a", R | W).unwrap();
         let text = "Hello, my name is Nastya".as_bytes();
         let written = fs.write(fd, text).unwrap();
 
         assert_eq!(written, text.len() as u64);
         assert_eq!(fs.opened_files.get(fd).unwrap().unwrap(), OpenedFile{
             inode_id: id,
-            offset: written
+            offset: written,
+            flags:R | W
         });
         assert_eq!(fs.pool.in_use(), 0);
     }
@@ -1388,14 +1443,15 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let id = fs.create_file("a").unwrap();
-        let fd = fs.open("a").unwrap();
+        let id = fs.create_file("a", 0o644).unwrap();
+        let fd = fs.open("a", R | W).unwrap();
         let text = "Hello".as_bytes();
         fs.write(fd, text).unwrap();
 
         assert_eq!(fs.opened_files.get(fd).unwrap().unwrap(), OpenedFile{
             inode_id: id,
-            offset: text.len() as u64
+            offset: text.len() as u64,
+            flags: R | W
         });
 
         let text2 = "World".as_bytes();
@@ -1403,7 +1459,8 @@ mod tests{
 
         assert_eq!(fs.opened_files.get(fd).unwrap().unwrap(), OpenedFile{
             inode_id: id,
-            offset: (text.len() + text2.len()) as u64
+            offset: (text.len() + text2.len()) as u64,
+            flags: R | W
         });
         assert_eq!(fs.pool.in_use(), 0);
     }
@@ -1417,10 +1474,10 @@ mod tests{
 
         assert_eq!(fs.write(0, b""), Err(FsError::EINVAL));
 
-        fs.create_file("a").unwrap();
-        fs.create_file("b").unwrap();
-        fs.open("a").unwrap();
-        fs.open("b").unwrap();
+        fs.create_file("a", 0o644).unwrap();
+        fs.create_file("b", 0o644).unwrap();
+        fs.open("a", R | W).unwrap();
+        fs.open("b", R | W).unwrap();
         fs.close(0).unwrap();
 
         let files_before = fs.opened_files.clone();
@@ -1441,13 +1498,14 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let id = fs.create_file("a").unwrap();
-        let fd = fs.open("a").unwrap();
+        let id = fs.create_file("a", 0o644).unwrap();
+        let fd = fs.open("a", R | W).unwrap();
         fs.write(fd, b"").unwrap();
 
         assert_eq!(fs.opened_files.get(fd).unwrap().unwrap(), OpenedFile{
             inode_id: id,
-            offset: 0
+            offset: 0,
+            flags: R | W
         });  
     }
 
@@ -1458,15 +1516,15 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, Some(32)).unwrap();
 
-        let id = fs.create_file("a").unwrap();
-        let fd = fs.open("a").unwrap();
+        let id = fs.create_file("a", 0o644).unwrap();
+        let fd = fs.open("a", R | W).unwrap();
         fs.write(fd, b"old").unwrap();
 
         let huge = vec![0u8; 500 * BLOCK_SIZE];
         let written = fs.write(fd, &huge).unwrap();
 
         assert!(written > 0 && written < huge.len() as u64);
-        assert_eq!(fs.opened_files[fd], Some(OpenedFile { inode_id: id, offset: 3 + written }));
+        assert_eq!(fs.opened_files[fd], Some(OpenedFile { inode_id: id, offset: 3 + written, flags: R | W }));
         assert_eq!(fs.stat_file("a").unwrap().size, 3 + written);
         assert_eq!(fs.superblock.free_blocks, 0);
 
@@ -1484,14 +1542,14 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let id = fs.create_file("a").unwrap();
-        let fd1 = fs.open("a").unwrap();
-        let fd2 = fs.open("a").unwrap();
+        let id = fs.create_file("a", 0o644).unwrap();
+        let fd1 = fs.open("a", R | W).unwrap();
+        let fd2 = fs.open("a", R | W).unwrap();
 
         fs.write(fd1, b"12345").unwrap();
 
-        assert_eq!(fs.opened_files[fd1], Some(OpenedFile { inode_id: id, offset: 5 }));
-        assert_eq!(fs.opened_files[fd2], Some(OpenedFile { inode_id: id, offset: 0 }));
+        assert_eq!(fs.opened_files[fd1], Some(OpenedFile { inode_id: id, offset: 5, flags: R | W }));
+        assert_eq!(fs.opened_files[fd2], Some(OpenedFile { inode_id: id, offset: 0, flags: R | W }));
         assert_eq!(fs.stat_file("a").unwrap().size, 5);
         assert_eq!(fs.pool.in_use(), 0);
     }
@@ -1506,8 +1564,8 @@ mod tests{
         let inodes_before = fs.superblock.free_inodes;
         let blocks_before = fs.superblock.free_blocks;
 
-        fs.create_file("a").unwrap();
-        let fd = fs.open("a").unwrap();
+        fs.create_file("a", 0o644).unwrap();
+        let fd = fs.open("a", R | W).unwrap();
         fs.unlink("a").unwrap();
         fs.write(fd, &vec![1u8; 3 * BLOCK_SIZE]).unwrap();
         assert_eq!(fs.superblock.free_blocks, blocks_before - 3);
@@ -1525,8 +1583,8 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.create_file("a").unwrap();
-        let fd = fs.open("a").unwrap();
+        fs.create_file("a", 0o644).unwrap();
+        let fd = fs.open("a", R | W).unwrap();
         fs.write(fd, b"Hello").unwrap();
 
         fs.seek(fd, 0).unwrap();
@@ -1545,8 +1603,8 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.create_file("a").unwrap();
-        let fd = fs.open("a").unwrap();
+        fs.create_file("a", 0o644).unwrap();
+        let fd = fs.open("a", R).unwrap();
         let mut buf = [0u8; 10];
 
         assert_eq!(fs.read(fd, &mut buf).unwrap(), 0);
@@ -1560,7 +1618,7 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.create_file("a").unwrap();
+        fs.create_file("a", 0o644).unwrap();
         let blocks_before = fs.superblock.free_blocks;
 
         fs.truncate("a", 3 * BLOCK_SIZE as u64 + 100).unwrap();
@@ -1579,8 +1637,8 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.create_file("a").unwrap();
-        let fd = fs.open("a").unwrap();
+        fs.create_file("a", 0o644).unwrap();
+        let fd = fs.open("a", R | W).unwrap();
         fs.truncate("a", 2 * BLOCK_SIZE as u64).unwrap();
 
         let mut buf = [0xFFu8; 2 * BLOCK_SIZE];
@@ -1598,8 +1656,8 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.create_file("a").unwrap();
-        let fd = fs.open("a").unwrap();
+        fs.create_file("a", 0o644).unwrap();
+        let fd = fs.open("a", R | W).unwrap();
         fs.write(fd, "Hello".as_bytes()).unwrap();
         let blocks_after_write = fs.superblock.free_blocks;
 
@@ -1624,8 +1682,8 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.create_file("a").unwrap();
-        let fd = fs.open("a").unwrap();
+        fs.create_file("a", 0o644).unwrap();
+        let fd = fs.open("a", R | W).unwrap();
         let blocks_before = fs.superblock.free_blocks;
 
         let data = [0xAAu8; 3*BLOCK_SIZE];
@@ -1654,8 +1712,8 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.create_file("a").unwrap();
-        let fd = fs.open("a").unwrap();
+        fs.create_file("a", 0o644).unwrap();
+        let fd = fs.open("a", R | W).unwrap();
         let blocks_before = fs.superblock.free_blocks;
 
         fs.write(fd, &vec![7u8; 3 * BLOCK_SIZE]).unwrap();
@@ -1676,8 +1734,8 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.create_file("a").unwrap();
-        let fd = fs.open("a").unwrap();
+        fs.create_file("a", 0o644).unwrap();
+        let fd = fs.open("a", R | W).unwrap();
         let blocks_before = fs.superblock.free_blocks;
 
         fs.write(fd, &[1u8; 20 * BLOCK_SIZE]).unwrap();
@@ -1699,8 +1757,8 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.create_file("a").unwrap();
-        let fd = fs.open("a").unwrap();
+        fs.create_file("a", 0o644).unwrap();
+        let fd = fs.open("a", R | W).unwrap();
         fs.write(fd, b"Hello").unwrap();
 
         let inode_before = fs.stat_file("a").unwrap();
@@ -1720,8 +1778,8 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.create_file("a").unwrap();
-        let fd = fs.open("a").unwrap();
+        fs.create_file("a", 0o644).unwrap();
+        let fd = fs.open("a", R | W).unwrap();
         fs.write(fd, b"Hello").unwrap();
 
         let inode_before = fs.stat_file("a").unwrap();
@@ -1746,7 +1804,7 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.create_file("a").unwrap();
+        fs.create_file("a", 0o644).unwrap();
         fs.link("a", "b").unwrap();
 
         fs.truncate("b", 777).unwrap();
@@ -1766,8 +1824,8 @@ mod tests{
         let inodes_before = fs.superblock.free_inodes;
         let blocks_before = fs.superblock.free_blocks;
 
-        fs.create_file("a").unwrap();
-        let fd = fs.open("a").unwrap();
+        fs.create_file("a", 0o644).unwrap();
+        let fd = fs.open("a", R | W).unwrap();
         fs.write(fd, &[3u8; 4 * BLOCK_SIZE]).unwrap();
         fs.truncate("a", 2 * BLOCK_SIZE as u64).unwrap();
         fs.truncate("a", 6 * BLOCK_SIZE as u64).unwrap();
@@ -1789,7 +1847,7 @@ mod tests{
 
         mk_node_tree(&mut fs.device, &fs.pool, &mut fs.superblock);
 
-        fs.create_file("/a/file").unwrap();
+        fs.create_file("/a/file", 0o644).unwrap();
         fs.symlink("/a/file", "/a/b/symlink").unwrap();
 
         let mut inode = fs.stat_file("/a/b/symlink").unwrap();
@@ -1797,7 +1855,7 @@ mod tests{
         assert_ne!(inode.direct[0], 0);
         let mut buff = [0u8; "/a/file".len()];
         read_file(&mut fs.device, &fs.pool, &mut fs.superblock, &mut inode, 0, &mut buff[..]).unwrap();
-        let fd = fs.open("/a/b/symlink").unwrap();
+        let fd = fs.open("/a/b/symlink", R | W).unwrap();
         fs.read(fd, &mut buff[..]).unwrap();
         assert_eq!(buff.to_ascii_lowercase(), b"/a/file");
         assert_eq!(fs.pool.in_use(), 0)
@@ -1832,7 +1890,7 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.create_file("file").unwrap();
+        fs.create_file("file", 0o644).unwrap();
         fs.symlink("target", "link").unwrap();
 
         let inodes_before = fs.superblock.free_inodes;
@@ -1896,7 +1954,7 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let created = fs.mkdir("dir").unwrap();
+        let created = fs.mkdir("dir", 0o755).unwrap();
         let list = fs.ls("dir").unwrap();
         assert_eq!(list.len(), 2);
         println!("{:?}", list);
@@ -1912,9 +1970,9 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.mkdir("dir").unwrap();
-        let id2 = fs.mkdir("/dir/a").unwrap();
-        assert_eq!(fs.mkdir("dir/a/"), Err(FsError::EEXIST));
+        fs.mkdir("dir", 0o755).unwrap();
+        let id2 = fs.mkdir("/dir/a", 0o755).unwrap();
+        assert_eq!(fs.mkdir("dir/a/", 0o755), Err(FsError::EEXIST));
 
         let list = fs.ls("dir").unwrap();
         assert_eq!(list.len(), 3);
@@ -1928,14 +1986,14 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.mkdir("dir").unwrap();
-        fs.mkdir("/dir/a").unwrap();
+        fs.mkdir("dir", 0o755).unwrap();
+        fs.mkdir("/dir/a", 0o755).unwrap();
         let mut inode = fs.stat_file("dir").unwrap();
         let nlink_before = inode.nlink;
-        assert_eq!(fs.mkdir("dir/a/"), Err(FsError::EEXIST));
-        assert_eq!(fs.mkdir("/"), Err(FsError::EEXIST));
-        assert_eq!(fs.mkdir("."), Err(FsError::EEXIST));
-        assert_eq!(fs.mkdir(".."), Err(FsError::EEXIST));
+        assert_eq!(fs.mkdir("dir/a/", 0o755), Err(FsError::EEXIST));
+        assert_eq!(fs.mkdir("/", 0o755), Err(FsError::EEXIST));
+        assert_eq!(fs.mkdir(".", 0o755), Err(FsError::EEXIST));
+        assert_eq!(fs.mkdir("..", 0o755), Err(FsError::EEXIST));
 
         inode = fs.stat_file("dir").unwrap();
         let list = fs.ls("dir").unwrap();
@@ -1950,14 +2008,14 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.mkdir("dir").unwrap();
-        fs.mkdir("dir/a").unwrap();
-        fs.mkdir("dir/a/b").unwrap();
-        fs.create_file("file").unwrap();
+        fs.mkdir("dir", 0o755).unwrap();
+        fs.mkdir("dir/a", 0o755).unwrap();
+        fs.mkdir("dir/a/b", 0o755).unwrap();
+        fs.create_file("file", 0o644).unwrap();
 
-        assert_eq!(fs.mkdir("/dir/c/b/k"), Err(FsError::ENOENT));
-        assert_eq!(fs.mkdir("file/a/b"), Err(FsError::ENOTDIR));
-        assert_eq!(fs.mkdir(""), Err(FsError::EINVAL));
+        assert_eq!(fs.mkdir("/dir/c/b/k", 0o755), Err(FsError::ENOENT));
+        assert_eq!(fs.mkdir("file/a/b", 0o755), Err(FsError::ENOTDIR));
+        assert_eq!(fs.mkdir("", 0o755), Err(FsError::EINVAL));
     }
 
     #[test]
@@ -1967,13 +2025,13 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.mkdir("dir").unwrap(); 
+        fs.mkdir("dir", 0o755).unwrap(); 
         let inodes_before = fs.superblock.free_inodes;
         let blocks_before = fs.superblock.free_blocks;
         let mut inode = fs.stat_file("dir").unwrap();
         let nlink_before = inode.nlink;
 
-        assert_eq!(fs.mkdir(&format!("/dir/{}", "a".repeat(60))), Err(FsError::ENAMETOOLONG));
+        assert_eq!(fs.mkdir(&format!("/dir/{}", "a".repeat(60)), 0o755), Err(FsError::ENAMETOOLONG));
         assert_eq!(fs.superblock.free_blocks, blocks_before);
         assert_eq!(fs.superblock.free_inodes, inodes_before);
         inode = fs.stat_file("dir").unwrap();
@@ -1992,7 +2050,7 @@ mod tests{
         let blocks_before = fs.superblock.free_blocks;
         let nlink_before = fs.stat_file("/").unwrap().nlink;
 
-        let id = fs.mkdir("dir").unwrap();
+        let id = fs.mkdir("dir", 0o755).unwrap();
         fs.rmdir("dir").unwrap();
 
         assert_eq!(fs.stat_file("dir"), Err(FsError::ENOENT));
@@ -2012,9 +2070,9 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.mkdir("dir").unwrap();
+        fs.mkdir("dir", 0o755).unwrap();
         fs.rmdir("dir").unwrap();
-        let id = fs.mkdir("dir").unwrap();
+        let id = fs.mkdir("dir", 0o755).unwrap();
 
         assert_eq!(fs.ls("dir").unwrap().len(), 2);
         assert_eq!(fs.stat_file("dir").unwrap().inode_type, Type::Dir);
@@ -2029,9 +2087,9 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.mkdir("dir").unwrap();
-        fs.mkdir("dir/sub").unwrap();
-        fs.create_file("dir/file").unwrap();
+        fs.mkdir("dir", 0o755).unwrap();
+        fs.mkdir("dir/sub", 0o755).unwrap();
+        fs.create_file("dir/file", 0o644).unwrap();
         fs.symlink("target", "dir/link").unwrap();
 
         let inodes_before = fs.superblock.free_inodes;
@@ -2056,8 +2114,8 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.mkdir("dir").unwrap();
-        fs.create_file("file").unwrap();
+        fs.mkdir("dir", 0o755).unwrap();
+        fs.create_file("file", 0o644).unwrap();
         fs.symlink("dir", "link").unwrap();
 
         let inodes_before = fs.superblock.free_inodes;
@@ -2079,7 +2137,7 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.mkdir("dir").unwrap();
+        fs.mkdir("dir", 0o755).unwrap();
 
         assert_eq!(fs.rmdir("nope"), Err(FsError::ENOENT));
         assert_eq!(fs.rmdir("dir/nope"), Err(FsError::ENOENT));
@@ -2096,8 +2154,8 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.mkdir("dir").unwrap();
-        fs.mkdir("dir/a").unwrap();
+        fs.mkdir("dir", 0o755).unwrap();
+        fs.mkdir("dir/a", 0o755).unwrap();
         fs.rmdir("dir/a").unwrap();
 
         let inodes_before = fs.superblock.free_inodes;
@@ -2125,11 +2183,11 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let a = fs.mkdir("a").unwrap();
+        let a = fs.mkdir("a", 0o755).unwrap();
         fs.cd("a").unwrap();
         assert_eq!(fs.cwd, a);
 
-        let b = fs.create_file("b").unwrap();
+        let b = fs.create_file("b", 0o644).unwrap();
 
         assert_eq!(fs.ls("/a").unwrap().last().unwrap(), &(b, "b".to_string()));
         assert_eq!(fs.ls("/").unwrap().len(), 3);
@@ -2143,8 +2201,8 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let a = fs.mkdir("a").unwrap();
-        fs.mkdir("a/b").unwrap();
+        let a = fs.mkdir("a", 0o755).unwrap();
+        fs.mkdir("a/b", 0o755).unwrap();
 
         fs.cd("/a/b").unwrap();
         fs.cd("..").unwrap();
@@ -2166,13 +2224,13 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let dir = fs.mkdir("dir").unwrap();
+        let dir = fs.mkdir("dir", 0o755).unwrap();
         fs.symlink("/dir", "link").unwrap();
 
         fs.cd("link").unwrap();
         assert_eq!(fs.cwd, dir);
 
-        let f = fs.create_file("f").unwrap();
+        let f = fs.create_file("f", 0o644).unwrap();
         assert_eq!(fs.ls("/dir").unwrap().last().unwrap(), &(f, "f".to_string()));
         assert_eq!(fs.pool.in_use(), 0);
     }
@@ -2184,8 +2242,8 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        let a = fs.mkdir("a").unwrap();
-        fs.create_file("a/file").unwrap();
+        let a = fs.mkdir("a", 0o755).unwrap();
+        fs.create_file("a/file", 0o644).unwrap();
         fs.cd("a").unwrap();
 
         assert_eq!(fs.cd("file"), Err(FsError::ENOTDIR));
@@ -2204,16 +2262,173 @@ mod tests{
         let pool = BufferPooll::new();
         let mut fs = Fs::format_fs(device, pool, None).unwrap();
 
-        fs.mkdir("a").unwrap();
-        let b = fs.mkdir("a/b").unwrap();
+        fs.mkdir("a", 0o755).unwrap();
+        let b = fs.mkdir("a/b", 0o755).unwrap();
         fs.cd("a/b").unwrap();
 
-        let x = fs.create_file("/x").unwrap();
+        let x = fs.create_file("/x", 0o644).unwrap();
 
         assert_eq!(fs.stat_file("/a/b").unwrap().id, b);
         assert_eq!(fs.stat_file("/x").unwrap().id, x);
         assert_eq!(fs.ls("/").unwrap().last().unwrap(), &(x, "x".to_string()));
         assert_eq!(fs.ls("").unwrap().len(), 2);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn create_file_with_invalid_mode_returns_einval_and_changes_nothing(){
+        let image = temp_image("create_file_with_invalid_mode_returns_einval_and_changes_nothing");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        let inodes_before = fs.superblock.free_inodes;
+        let blocks_before = fs.superblock.free_blocks;
+
+        assert_eq!(fs.create_file("a", 0o1000), Err(FsError::EINVAL));
+        assert_eq!(fs.create_file("b", 0o4755), Err(FsError::EINVAL));
+        assert_eq!(fs.create_file("c", 0o10000), Err(FsError::EINVAL));
+
+        assert_eq!(fs.superblock.free_inodes, inodes_before);
+        assert_eq!(fs.superblock.free_blocks, blocks_before);
+        assert_eq!(fs.ls("").unwrap().len(), 2);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn created_inode_gets_mode_and_owner_of_current_user(){
+        let image = temp_image("created_inode_gets_mode_and_owner_of_current_user");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+
+        let user = CurrentUser { uid: 1000, gid: 1000 };
+        fs.set_user(user);
+
+        let f = fs.create_file("f", 0o640).unwrap();
+        let d = fs.mkdir("d", 0o750).unwrap();
+
+        let file = inode_table::read(f, &mut fs.device, &fs.superblock, &fs.pool).unwrap();
+        let dir = inode_table::read(d, &mut fs.device, &fs.superblock, &fs.pool).unwrap();
+
+        assert_eq!((file.mode, file.uid, file.gid), (0o640, 1000, 1000));
+        assert_eq!((dir.mode, dir.uid, dir.gid), (0o750, 1000, 1000));
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    const USER: CurrentUser = CurrentUser { uid: 1000, gid: 1000 };
+    const OTHER: CurrentUser = CurrentUser { uid: 2000, gid: 2000 };
+
+    #[test]
+    fn modifying_dir_without_write_returns_eacces_and_changes_nothing(){
+        let image = temp_image("modifying_dir_without_write");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+        fs.mkdir("ro", 0o755).unwrap();
+        fs.create_file("ro/f", 0o666).unwrap();
+        fs.create_file("outside", 0o666).unwrap();
+
+        fs.set_user(USER);
+        let inodes_before = fs.superblock.free_inodes;
+        let blocks_before = fs.superblock.free_blocks;
+
+        assert_eq!(fs.create_file("ro/new", 0o644), Err(FsError::EACCES));
+        assert_eq!(fs.mkdir("ro/d", 0o755), Err(FsError::EACCES));
+        assert_eq!(fs.symlink("target", "ro/l"), Err(FsError::EACCES));
+        assert_eq!(fs.link("outside", "ro/hard"), Err(FsError::EACCES));
+        assert_eq!(fs.unlink("ro/f"), Err(FsError::EACCES));
+        assert_eq!(fs.rmdir("ro/sub"), Err(FsError::EACCES));
+
+        assert_eq!(fs.superblock.free_inodes, inodes_before);
+        assert_eq!(fs.superblock.free_blocks, blocks_before);
+        assert_eq!(fs.stat_file("outside").unwrap().nlink, 1);
+        fs.set_user(ROOT_USER);
+        assert_eq!(fs.ls("ro").unwrap().len(), 3);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn ls_needs_read_and_cd_needs_exec(){
+        let image = temp_image("ls_needs_read_and_cd_needs_exec");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+        let no_read = fs.mkdir("no_read", 0o711).unwrap();
+        fs.mkdir("no_exec", 0o744).unwrap();
+
+        fs.set_user(USER);
+
+        assert_eq!(fs.ls("no_read"), Err(FsError::EACCES));
+        assert_eq!(fs.cd("no_read"), Ok(()));
+        assert_eq!(fs.cwd, no_read);
+        fs.cd("/").unwrap();
+
+        assert_eq!(fs.ls("no_exec").unwrap().len(), 2);
+        assert_eq!(fs.cd("no_exec"), Err(FsError::EACCES));
+        assert_eq!(fs.cwd, ROOT_INODE);
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn path_through_dir_without_exec_is_denied(){
+        let image = temp_image("path_through_dir_without_exec");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+        fs.mkdir("secret", 0o700).unwrap();
+        fs.create_file("secret/f", 0o666).unwrap();
+
+        fs.set_user(USER);
+
+        assert_eq!(fs.stat_file("secret/f"), Err(FsError::EACCES));
+        assert_eq!(fs.open("secret/f", R), Err(FsError::EACCES));
+        assert_eq!(fs.truncate("secret/f", 0), Err(FsError::EACCES));
+        assert_eq!(fs.create_file("secret/g", 0o644), Err(FsError::EACCES));
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn file_access_depends_on_owner_and_other_class(){
+        let image = temp_image("file_access_depends_on");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+        fs.mkdir("home", 0o777).unwrap();
+
+        fs.set_user(USER);
+        fs.create_file("home/f", 0o600).unwrap();
+        fs.truncate("home/f", 100).unwrap();
+        let fd = fs.open("home/f", R).unwrap();
+        fs.close(fd).unwrap();
+
+        fs.set_user(OTHER);
+        assert_eq!(fs.truncate("home/f", 0), Err(FsError::EACCES));
+        assert_eq!(fs.open("home/f", R), Err(FsError::EACCES));
+        assert_eq!(fs.stat_file("home/f").unwrap().size, 100);
+        assert!(fs.opened_files.iter().all(|f| f.is_none()));
+        assert!(fs.opened_inodes.is_empty());
+        assert_eq!(fs.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn root_ignores_permission_bits(){
+        let image = temp_image("root_ignores_permission_bits");
+        let device = FileDevice::create(image.to_str().unwrap(), 4 * MIB).unwrap();
+        let pool = BufferPooll::new();
+        let mut fs = Fs::format_fs(device, pool, None).unwrap();
+        fs.mkdir("locked", 0o000).unwrap();
+
+        fs.create_file("locked/f", 0o000).unwrap();
+        fs.truncate("locked/f", 10).unwrap();
+        let fd = fs.open("locked/f", R | W).unwrap();
+        fs.close(fd).unwrap();
+        fs.cd("locked").unwrap();
+        assert_eq!(fs.ls("").unwrap().len(), 3);
+
+        fs.cd("/").unwrap();
+        fs.unlink("locked/f").unwrap();
+        fs.rmdir("locked").unwrap();
         assert_eq!(fs.pool.in_use(), 0);
     }
 }

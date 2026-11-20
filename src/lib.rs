@@ -16,3 +16,4 @@ pub mod file_io;
 pub mod directory;
 pub mod fs;
 pub mod path;
+pub mod perm;

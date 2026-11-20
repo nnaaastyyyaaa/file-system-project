@@ -4,7 +4,7 @@ use std::io;
 pub enum FsError{
     EEXIST,
     ENOENT,
-    EACCESS,
+    EACCES,
     EISDIR,
     ENOSPC, 
     EFBIG,
